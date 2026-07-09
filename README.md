@@ -6,6 +6,12 @@
 
 Please prepare the training environment according to [BEVDet](https://github.com/HuangJunJie2017/BEVDet?tab=readme-ov-file#get-started).  
 
+install env:
+
+```shell
+conda env create -f requirements/full_env.yaml 
+```
+
 training script:
 
 ```shell
@@ -18,6 +24,30 @@ test script:
 ./tools/dist_test.sh configs/fastbev/paper/fastbev-r50-cbgs.py work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth 8 --eval mAP 2>&1 | tee work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth.log
 ```
 
+
+visualization results:
+
+```shell
+# 输出 JSON 格式结果
+./tools/dist_test.sh configs/fastbev/paper/fastbev-r50-cbgs.py \
+  work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth 2 \
+  --format-only \
+  --eval-options 'jsonfile_prefix=work_dirs/fastbev-r50-cbgs/results'
+  
+  
+  #如果用最新的自己训练的模型，可以执行命令
+  
+ ./tools/dist_test.sh configs/fastbev/paper/fastbev-r50-cbgs.py \
+  work_dirs/fastbev-r50-cbgs/latest.pth 2 \      
+  --format-only \                             
+  --eval-options 'jsonfile_prefix=work_dirs/fastbev-r50-cbgs/results'
+
+# 可视化
+python tools/analysis_tools/vis.py work_dirs/fastbev-r50-cbgs/results/pts_bbox/results_nusc.json \
+  --root_path data/nuscenes \
+  --save_path work_dirs/fastbev-r50-cbgs/vis_bev \
+  --show-range 50 --vis-thred 0.3 --draw-gt --format video --fps 10
+```
 ## Main Results
 
 ![](./resources/fastbev++_exps.jpg)
