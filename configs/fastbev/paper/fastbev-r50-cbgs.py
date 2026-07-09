@@ -288,3 +288,5 @@ custom_hooks = [
 
 # fp16 = dict(loss_scale='dynamic')
 resume_from = 'work_dirs/fastbev-r50-cbgs/latest.pth'
+# load_from = 'data/ckpts/epoch_20_ema_4d.pth'
+# resume_from = 'work_dirs/fastbev-r50-cbgs/latest.pth'

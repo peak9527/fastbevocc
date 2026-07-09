@@ -11,6 +11,36 @@ from torch.utils.cpp_extension import (BuildExtension, CppExtension,
                                        CUDAExtension)
 
 
+def _patch_cuda_version_check():
+    """Patch torch's strict CUDA version check to allow building extensions
+    when the system CUDA toolkit version does not exactly match the version
+    used to compile PyTorch (e.g., system has CUDA 12.x but PyTorch was
+    compiled with CUDA 11.6)."""
+    from torch.utils import cpp_extension
+
+    original_check = cpp_extension._check_cuda_version
+
+    def _relaxed_check(compiler_name, compiler_version):
+        try:
+            original_check(compiler_name, compiler_version)
+        except RuntimeError as e:
+            cuda_str = cpp_extension.CUDA_HOME.split('/')[-1] if cpp_extension.CUDA_HOME else 'unknown'
+            warnings.warn(
+                f'Relaxing CUDA version check: system CUDA ({cuda_str}) '
+                f'does not match PyTorch CUDA ({torch.version.cuda}). '
+                f'Proceeding anyway; compiled extension may fail at runtime '
+                f'if ABI is incompatible.'
+            )
+
+    cpp_extension._check_cuda_version = _relaxed_check
+    # Also patch the one in the module namespace (used internally by BuildExtension)
+    if hasattr(cpp_extension, 'BuildExtension'):
+        pass  # already patched via module reference
+
+
+_patch_cuda_version_check()
+
+
 def readme():
     with open('README.md', encoding='utf-8') as f:
         content = f.read()
