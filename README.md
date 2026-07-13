@@ -14,6 +14,7 @@ conda env create -f requirements/full_env.yaml
 
 training script:
 
+
 ```shell
 ./tools/dist_train.sh configs/fastbev/paper/fastbev-r50-cbgs.py 8
 ```
@@ -48,6 +49,14 @@ python tools/analysis_tools/vis.py work_dirs/fastbev-r50-cbgs/results/pts_bbox/r
   --save_path work_dirs/fastbev-r50-cbgs/vis_bev \
   --show-range 50 --vis-thred 0.3 --draw-gt --format video --fps 10
 ```
+## 使用自定义数据进行推理和可视化
+test script:
+
+```shell
+./tools/dist_test.sh configs/fastbev/paper/fastbev-r50-cbgs.py work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth 8 --eval mAP 2>&1 | tee work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth.log
+```
+
+
 ## Main Results
 
 ![](./resources/fastbev++_exps.jpg)

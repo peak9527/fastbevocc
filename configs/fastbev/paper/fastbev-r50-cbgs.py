@@ -276,7 +276,7 @@ lr_config = dict(
     warmup_iters=200,
     warmup_ratio=0.001,
     step=[20,])
-runner = dict(type='EpochBasedRunner', max_epochs=20)
+runner = dict(type='EpochBasedRunner', max_epochs=100)
 
 custom_hooks = [
     dict(
