@@ -3,15 +3,29 @@
 可视化自定义 pkl 中的点云和图像, 用于验证标定是否正确。
 
 用法:
+    # 遍历全部帧
     python tools/vis_custom_pkl.py --pkl custom_infos_val.pkl --show-range 50
+    # 指定帧索引
+    python tools/vis_custom_pkl.py --pkl custom_infos_val.pkl --idx 0
+    # 指定 token
+    python tools/vis_custom_pkl.py --pkl custom_infos_val.pkl --token xxxxx
+    # 输入图片路径, 自动时间戳匹配 (推荐)
+    python tools/vis_custom_pkl.py --pkl custom_infos_val.pkl --img /path/to/frontmain/xxx.jpg
 """
 
 import argparse
+import bisect
 import os
 import pickle
+import re
+import sys
 
 import cv2
 import numpy as np
+
+
+CAM_NAMES = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
+             'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
 
 
 def parse_args():
@@ -23,7 +37,105 @@ def parse_args():
                         help='Point size in BEV canvas (default: 1)')
     parser.add_argument('--save-dir', type=str, default='./vis_custom_output',
                         help='Directory to save visualization images')
+    parser.add_argument('--idx', type=int, default=None,
+                        help='可视化指定帧索引 (从 0 开始), 不指定则遍历全部')
+    parser.add_argument('--token', type=str, default=None,
+                        help='可视化指定 token 帧, 与 --idx / --img 互斥')
+    parser.add_argument('--img', type=str, default=None,
+                        help='输入单张图片路径, 按时间戳自动匹配 pkl 中的帧')
+    parser.add_argument('--cam', type=str, default=None,
+                        choices=CAM_NAMES,
+                        help='相机名称 (默认从图片路径自动推断)')
+    parser.add_argument('--max-diff-ms', type=int, default=200,
+                        help='lidar 与图片最大允许时差 (ms, 默认: )')
     return parser.parse_args()
+
+
+def get_ts_from_filename(file_path):
+    """从文件名提取时间戳, 返回微秒级整数.
+
+    文件名格式: n008-2018-08-01-15-16-36-0400__CAM_FRONT__1533151061512404.jpg
+    第一组 "008" 是场景号, 最后一组 "1533151061512404" 才是微秒时间戳。
+    """
+    basename = os.path.basename(file_path)
+    matches = re.findall(r"\d+", basename)
+    if not matches:
+        raise ValueError(f"无法从文件名提取时间戳: {basename}")
+    return int(matches[-1])
+
+
+def detect_cam_from_path(img_path):
+    """从图片路径中自动推断相机名称, 如 .../frontmain/xxx.jpg → CAM_FRONT"""
+    norm = img_path.replace('\\', '/')
+    # 支持自定义命名 → nuScenes 标准名映射
+    name_hints = {
+        'frontmain': 'CAM_FRONT',
+        'front_main': 'CAM_FRONT',
+        'rear': 'CAM_BACK',
+        'leftrepeater': 'CAM_FRONT_LEFT',
+        'rightrepeater': 'CAM_FRONT_RIGHT',
+        'leftpillar': 'CAM_BACK_LEFT',
+        'rightpillar': 'CAM_BACK_RIGHT',
+    }
+    for hint, cam in name_hints.items():
+        if hint in norm.lower():
+            return cam
+    # nuScenes 标准名
+    for cam in CAM_NAMES:
+        if cam in norm.upper() or cam in norm:
+            return cam
+    return None
+
+
+def find_best_frame_from_pkl(infos, cam_name, target_ts, max_diff_ms):
+    """按时间戳在 pkl 中二分查找最匹配的帧.
+
+    Args:
+        target_ts:   目标时间戳 (微秒)
+        max_diff_ms: 最大允许时差 (毫秒)
+
+    返回 (frame_idx, info_dict) 或 (None, None).
+    """
+    ts_list = []
+    for i, info in enumerate(infos):
+        if cam_name in info.get('cams', {}):
+            data_path = info['cams'][cam_name]['data_path']
+            try:
+                ts = get_ts_from_filename(data_path)
+                ts_list.append((ts, i))
+            except ValueError:
+                pass
+
+    if not ts_list:
+        return None, None
+
+    ts_list.sort(key=lambda x: x[0])
+    timestamps = [t[0] for t in ts_list]
+    pos = bisect.bisect_left(timestamps, target_ts)
+
+    candidates = []
+    if pos < len(timestamps):
+        candidates.append((timestamps[pos], ts_list[pos][1]))
+    if pos > 0:
+        candidates.append((timestamps[pos - 1], ts_list[pos - 1][1]))
+
+    if not candidates:
+        return None, None
+
+    best_ts, best_idx = min(candidates, key=lambda x: abs(x[0] - target_ts))
+    # 文件名中时间戳是微秒级, 除以 1000 转换为毫秒后与阈值比较
+    diff_ms = abs(best_ts - target_ts) / 1000.0
+
+    print(f"\n时间戳匹配:")
+    print(f"  目标图片 ts (μs): {target_ts}")
+    print(f"  pkl 最近 ts  (μs): {best_ts} (frame[{best_idx}])")
+    print(f"  时差:        {diff_ms:.1f} ms (阈值: {max_diff_ms} ms)")
+
+    if diff_ms > max_diff_ms:
+        print(f"  时差超过阈值 {max_diff_ms}ms, 无匹配帧!")
+        return None, None
+
+    return best_idx, infos[best_idx]
 
 
 def _load_lidar_points(lidar_path):
@@ -106,9 +218,49 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    for idx, info in enumerate(dataset['infos']):
+    # 确定要处理的帧
+    infos = dataset['infos']
+    if args.img is not None:
+        # ----- --img 模式: 输入图片路径, 自动时间戳匹配 -----
+        if not os.path.exists(args.img):
+            print(f"ERROR: 图片不存在: {args.img}")
+            sys.exit(1)
+        target_img_ts = get_ts_from_filename(args.img)
+        print(f"输入图片: {args.img}  (ts={target_img_ts} μs)")
+
+        if args.cam is None:
+            args.cam = detect_cam_from_path(args.img)
+            if args.cam is None:
+                print("ERROR: 无法从图片路径自动推断相机名称, 请用 --cam 指定")
+                sys.exit(1)
+            print(f"自动推断相机: {args.cam}")
+
+        frame_idx, info = find_best_frame_from_pkl(
+            infos, args.cam, target_img_ts, args.max_diff_ms)
+        if frame_idx is None:
+            print("ERROR: 在 pkl 中未找到时间戳匹配的帧")
+            sys.exit(1)
+        frames = [(frame_idx, info)]
+    elif args.token is not None:
+        # 按 token 查找
+        token_to_info = {i['token']: (idx, i) for idx, i in enumerate(infos)}
+        if args.token not in token_to_info:
+            print(f"ERROR: token '{args.token}' not found in pkl")
+            return
+        idx, info = token_to_info[args.token]
+        frames = [(idx, info)]
+        print(f"Matched: token={args.token}, idx={idx}")
+    elif args.idx is not None:
+        if args.idx < 0 or args.idx >= len(infos):
+            print(f"ERROR: idx={args.idx} out of range [0, {len(infos)-1}]")
+            return
+        frames = [(args.idx, infos[args.idx])]
+    else:
+        frames = list(enumerate(infos))
+
+    for idx, info in frames:
         token = info['token']
-        print(f"\n[{idx+1}/{len(dataset['infos'])}] Frame: {token}")
+        print(f"\n[{idx+1}/{len(infos)}] Frame: {token}")
 
         # 1. 读取并显示点云 BEV
         lidar_path = info['lidar_path']

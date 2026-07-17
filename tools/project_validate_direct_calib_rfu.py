@@ -99,9 +99,16 @@ def load_lidar_bin(path):
     return pts[:, :3]
 
 def get_ts_from_filename(file_path):
+    """从文件名提取时间戳, 返回微秒级整数.
+
+    文件名格式: n008-2018-08-01-15-16-36-0400__CAM_FRONT__1533151061512404.jpg
+    第一组 "008" 是场景号, 最后一组 "1533151061512404" 才是微秒时间戳。
+    """
     basename = os.path.basename(file_path)
-    ts_str = re.search(r"\d+", basename).group()
-    return int(ts_str)
+    matches = re.findall(r"\d+", basename)
+    if not matches:
+        raise ValueError(f"无法从文件名提取时间戳: {basename}")
+    return int(matches[-1])
 
 def match_lidar_by_approx_ts(data_root, target_img_ts, max_diff_ms):
     lidar_dir = os.path.join(data_root, "lidar")
@@ -126,12 +133,13 @@ def match_lidar_by_approx_ts(data_root, target_img_ts, max_diff_ms):
     if pos > 0:
         candidate_ts.append(lidar_ts_sorted[pos-1])
     best_ts = min(candidate_ts, key=lambda x: abs(x - target_img_ts))
-    diff_ms = abs(best_ts - target_img_ts)
+    # 文件名中时间戳是微秒级, 除以 1000 转换为毫秒后与阈值比较
+    diff_ms = abs(best_ts - target_img_ts) / 1000.0
     if diff_ms <= max_diff_ms:
-        print(f"匹配时差: {diff_ms} ms (允许最大{max_diff_ms}ms)")
+        print(f"匹配时差: {diff_ms:.1f} ms (允许最大{max_diff_ms}ms)")
         return lidar_path_map[best_ts]
     else:
-        print(f"最近时差{diff_ms}ms，超过阈值{max_diff_ms}ms，无匹配点云")
+        print(f"最近时差{diff_ms:.1f}ms，超过阈值{max_diff_ms}ms，无匹配点云")
         return None
 
 def load_camera_extrinsic_RFU():

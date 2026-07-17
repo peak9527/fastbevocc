@@ -1,26 +1,26 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
 #
-# 基于 fastbev-r50-cbgs.py 的自定义 6 相机数据集推理配置
-# 相机命名与 nuScenes 一致: CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT,
-#                         CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT
+# 自定义数据集训练配置
+# 基于 fastbev-r50-cbgs.py，适配 SUSTechPOINTS 数据格式
 #
 # 用法:
-#   ./tools/dist_test.sh configs/fastbev/paper/fastbev-r50-cbgs-custom.py \
-#       work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth 1 \
-#       --format-only \
-#       --eval-options 'jsonfile_prefix=work_dirs/fastbev-r50-cbgs/results_custom'
+#   ./tools/dist_train.sh configs/fastbev/paper/fastbev-r50-cbgs-custom-train.py 2
 
-# inherit base
 _base_ = ['./fastbev-r50-cbgs.py']
 
+# ========== 覆盖数据集路径 ==========
+# pkl 中路径为相对路径 (data/custom_data/...)，所以 data_root 设为本项目根目录
+data_root = './'
+
 # ========== 覆盖相机配置 ==========
-# 使用 nuScenes 6 相机命名
+# 注意: 不同相机分辨率不同 (frontmain=3840x2160, 其余≈1920x1536)
+# src_size 设为最大分辨率，PrepareImageInputs 会自动按实际尺寸计算 resize 比例
 data_config = dict(
     cams=['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT',
           'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
     Ncams=6,
     input_size=(256, 704),
-    src_size=(3840, 2160),       # 实际图像分辨率: 3840x2160
+    src_size=(2160, 3840),
     resize=(-0.06, 0.11),
     rot=(-5.4, 5.4),
     flip=True,
@@ -28,35 +28,78 @@ data_config = dict(
     resize_test=0.00,
 )
 
-# ========== 覆盖数据集路径 ==========
-data_root = 'data/custom_data/'
-
+# ========== BEV 增强（与 nuScenes 一致） ==========
 bda_aug_conf = dict(
     rot_lim=(-22.5, 22.5),
     scale_lim=(0.95, 1.05),
     flip_dx_ratio=0.5,
     flip_dy_ratio=0.5)
 
-# 测试 pipeline
-# BEVAug 必须保留: 负责将 img_inputs 从 6 元组扩展为 7 元组 (加入 bda_mat)
-# LoadAnnotations 必须保留: BEVAug 依赖 gt_bboxes_3d (测试模式下 bda=恒等矩阵)
+# ========== 训练 pipeline ==========
+train_pipeline = [
+    dict(
+        type='PrepareImageInputs',
+        is_train=True,
+        data_config=data_config),
+    dict(type='LoadAnnotations'),
+    dict(
+        type='BEVAug',
+        bda_aug_conf=bda_aug_conf,
+        classes=[
+            'car', 'truck', 'cyclist', 'bus', 'cone',
+            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+        ]),
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=4,            # SUSTechPOINTS 点云: x, y, z, intensity
+        use_dim=4,
+        file_client_args=dict(backend='disk')),
+    dict(
+        type='PointToMultiViewDepth',
+        downsample=1,
+        grid_config=dict(
+            x=[-51.2, 51.2, 0.8],
+            y=[-51.2, 51.2, 0.8],
+            z=[-2.5, 4.5, 1.0],
+            depth=[1.0, 60.0, 1.0])),
+    dict(
+        type='ObjectRangeFilter',
+        point_cloud_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]),
+    dict(
+        type='ObjectNameFilter',
+        classes=[
+            'car', 'truck', 'cyclist', 'bus', 'cone',
+            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+        ]),
+    dict(
+        type='DefaultFormatBundle3D',
+        class_names=[
+            'car', 'truck', 'cyclist', 'bus', 'cone',
+            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+        ]),
+    dict(
+        type='Collect3D',
+        keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_depth'])
+]
+
+# ========== 测试/验证 pipeline ==========
 test_pipeline = [
     dict(type='PrepareImageInputs', data_config=data_config),
     dict(type='LoadAnnotations'),
     dict(type='BEVAug',
          bda_aug_conf=bda_aug_conf,
          classes=[
-            'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+            'car', 'truck', 'cyclist', 'bus', 'cone',
             'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
          ],
          is_train=False),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,      # 自定义点云 4 字段 (x,y,z,intensity)
+        load_dim=4,
         use_dim=4,
         file_client_args=dict(backend='disk')),
-    # sensor2lidar 在 pkl 中已是 RFU 等价形式，无需额外坐标转换
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -66,7 +109,7 @@ test_pipeline = [
             dict(
                 type='DefaultFormatBundle3D',
                 class_names=[
-                    'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+                    'car', 'truck', 'cyclist', 'bus', 'cone',
                     'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
                 ],
                 with_label=False),
@@ -74,57 +117,64 @@ test_pipeline = [
         ])
 ]
 
+# ========== 数据集配置 ==========
+dataset_type = 'NuScenesDataset'
+class_names = [
+    'car', 'truck', 'cyclist', 'bus', 'cone',
+    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+]
+
+input_modality = dict(
+    use_lidar=False,
+    use_camera=True,
+    use_radar=False,
+    use_map=False,
+    use_external=False)
+
+share_data_config = dict(
+    type=dataset_type,
+    classes=class_names,
+    modality=input_modality,
+    img_info_prototype='bevdet',
+    ego_cam='CAM_FRONT',
+)
+
+# 训练 / 验证共用一个 pkl（数据量小，建议后续分 train/val）
+ann_file = 'custom_infos_train.pkl'
+
 test_data_config = dict(
     pipeline=test_pipeline,
-    ann_file='./custom_infos_val.pkl',
-)
+    ann_file=ann_file)
 
-# 重建 data dict (因为 _base_ 的 data dict 会被此文件的 data 完全替换)
-# train 部分保留原样（不使用），test/val 用自定义
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=1,          # 自定义数据集帧数少，batch size 用 1
     workers_per_gpu=2,
-    val=dict(
-        pipeline=test_pipeline,
-        ann_file='./custom_infos_val.pkl',
-    ),
-    test=dict(
-        pipeline=test_pipeline,
-        ann_file='./custom_infos_val.pkl',
-    ),
-)
-
-# 共享的 dataset 元信息
-share_data_config = dict(
-    type='NuScenesDataset',
-    ego_cam='CAM_FRONT',     # 必须与 pkl 中 cams 的 key 一致, format_results 用此相机做坐标变换
-    classes=[
-        'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
-        'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-    ],
-    modality=dict(
-        use_lidar=False,
-        use_camera=True,
-        use_radar=False,
-        use_map=False,
-        use_external=False),
-    img_info_prototype='bevdet',
-)
+    train=dict(
+        type='CBGSDataset',
+        dataset=dict(
+            data_root=data_root,
+            ann_file=ann_file,
+            pipeline=train_pipeline,
+            classes=class_names,
+            test_mode=False,
+            use_valid_flag=True,
+            box_type_3d='LiDAR')),
+    val=test_data_config,
+    test=test_data_config)
 
 for key in ['val', 'test']:
     data[key].update(share_data_config)
-    data[key]['data_root'] = data_root  # 覆盖 base config 继承的 'data/nuscenes/'
+    data[key]['data_root'] = data_root
 
-# 临时：把 score 阈值降到 0，验证模型是否产出任何预测
-# 注意：_base_ 中 model 通过 deep-merge 合并，不能写 model.test_cfg.pts.xxx
-# CenterPoint 有两层 score filter，必须同时覆盖！
-#   bbox_coder.score_threshold → decode 阶段过滤 (此处是真正的过滤点)
-#   test_cfg.pts.score_threshold → NMS 后处理过滤
-model = dict(
-    pts_bbox_head=dict(
-        bbox_coder=dict(score_threshold=0.0)
-    ),
-    test_cfg=dict(
-        pts=dict(score_threshold=0.0)
-    )
-)
+data['train']['dataset'].update(share_data_config)
+data['train']['dataset']['data_root'] = data_root
+# ========== 训练设置 ==========
+optimizer = dict(type='AdamW', lr=1e-4, weight_decay=1e-2)
+runner = dict(type='EpochBasedRunner', max_epochs=125)
+
+# 禁用继承来的 resume_from，确保从头训练并仅加载预训练权重
+# resume_from = None
+# 加载预训练权重 (transfer learning)
+resume_from = 'work_dirs/fastbev-r50-cbgs-custom/latest.pth'
+# load_from = 'work_dirs/fastbev-r50-cbgs-custom/epoch_20_nusenes_ema.pth'
+# load_from = 'data/ckpts/epoch_20_ema.pth'

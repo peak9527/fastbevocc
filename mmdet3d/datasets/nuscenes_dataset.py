@@ -184,7 +184,7 @@ class NuScenesDataset(Custom3DDataset):
         info = self.data_infos[idx]
         if self.use_valid_flag:
             mask = info['valid_flag']
-            gt_names = set(info['gt_names'][mask])
+            gt_names = set(np.array(info['gt_names'])[mask])
         else:
             gt_names = set(info['gt_names'])
 

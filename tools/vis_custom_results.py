@@ -193,6 +193,19 @@ def _build_layout(num_views, scale_factor, canva_size):
     }
 
 
+def _is_ego2global_identity(infos_list):
+    """检查所有帧的 ego2global 是否都是恒等变换 (自定义数据集标志)"""
+    for info in infos_list[:10]:  # 采样前 10 帧
+        rot = Quaternion(info.get('ego2global_rotation', [1, 0, 0, 0]))
+        trans = info.get('ego2global_translation', [0, 0, 0])
+        if abs(rot.w - 1.0) > 1e-4 or abs(rot.x) > 1e-4 \
+                or abs(rot.y) > 1e-4 or abs(rot.z) > 1e-4:
+            return False
+        if abs(trans[0]) > 1e-4 or abs(trans[1]) > 1e-4 or abs(trans[2]) > 1e-4:
+            return False
+    return True
+
+
 def main():
     args = parse_args()
     # load predicted results
@@ -205,6 +218,23 @@ def main():
     cam_names = sorted(infos_list[0]['cams'].keys())
     num_cams = len(cam_names)
     print(f'Detected {num_cams} camera(s): {cam_names}')
+
+    # --- 确定 yaw 偏移 ---
+    # 自定义数据: ego2global=I, 预测和 GT 均在 ego/LiDAR frame
+    #   gt_boxes 按 nuScenes 约定存储为 [x,y,z,l,w,h,yaw],
+    #   LiDARInstance3DBoxes 中 yaw=0 对应 x 正方向(前),
+    #   因此自定义数据不需要任何 yaw 偏移
+    # nuScenes 数据: 预测在 global frame, 需要 π/2 偏移
+    is_custom = _is_ego2global_identity(infos_list)
+    if is_custom:
+        print('Dataset: custom (ego2global = identity, predictions in ego frame)')
+        yaw_offset = 0.0
+        print(f'Using yaw_offset = {yaw_offset:.4f} (FLU convention: 0 = forward)')
+    else:
+        print('Dataset: nuScenes (ego2global varies, predictions in global frame)')
+        yaw_offset = args.yaw_offset
+        print(f'Using --yaw-offset: {yaw_offset:.4f}')
+    # -----------------------------------------
 
     # build layout
     layout = _build_layout(num_cams, args.scale_factor, args.canva_size)
@@ -252,7 +282,7 @@ def main():
             pred_boxes.append([
                 trans[0], trans[1], trans[2],
                 size[1], size[0], size[2],  # x_size=l, y_size=w, z_size=h
-                yaw + args.yaw_offset
+                yaw + yaw_offset
             ])
 
         if len(pred_boxes) == 0:
@@ -275,17 +305,13 @@ def main():
         ]
 
         # --- draw GT if requested ---
-        # custom_infos_val.pkl stores gt_boxes as [x,y,z,w,l,h,yaw]
-        # with yaw=0 meaning length (l) is along x (front).
+        # custom_infos_train.pkl stores gt_boxes as [x,y,z,l,w,h,yaw]
+        # in FLU convention (yaw=0 means length (l) is along x/front).
         # LiDARInstance3DBoxes expects [x,y,z,x_size,y_size,z_size,yaw],
-        # so we swap w/l but do NOT add the nuScenes-specific pi/2 yaw offset.
+        # i.e. x_size=l, y_size=w — exactly what the pkl provides, no swap needed.
         if args.draw_gt and infos.get('gt_boxes') is not None \
                 and len(infos['gt_boxes']) > 0:
             gt_boxes = infos['gt_boxes'].copy()
-            width = gt_boxes[:, 3].copy()
-            length = gt_boxes[:, 4].copy()
-            gt_boxes[:, 3] = length
-            gt_boxes[:, 4] = width
             corners_lidar_gt = \
                 LB(gt_boxes,
                    origin=(0.5, 0.5, 0.5)).corners.numpy().reshape(-1, 3)

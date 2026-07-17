@@ -42,7 +42,7 @@ def parse_args():
                         help=f'lidar 与图片最大允许时差 (ms, 默认: {MAX_TIME_DIFF_MS})')
     parser.add_argument('--save', type=str, default=SAVE_IMG,
                         help=f'输出图片路径 (默认: {SAVE_IMG})')
-    parser.add_argument('--point-size', type=int, default=1,
+    parser.add_argument('--point-size', type=int, default=2,
                         help='投影像素大小 (默认: 1)')
     parser.add_argument('--min-depth', type=float, default=0.2,
                         help='最小深度过滤 (默认: 0.2m)')
@@ -50,7 +50,7 @@ def parse_args():
                         help='是否做图像去畸变 (需同时提供 --calib-root)')
     parser.add_argument('--calib-root', type=str, default='./data/calibration',
                         help='标定文件根目录 (用于读取畸变系数 D, 默认: ./data/calibration)')
-    parser.add_argument('--color', type=str, default='green',
+    parser.add_argument('--color', type=str, default='red',
                         choices=['green', 'red', 'blue', 'yellow', 'cyan', 'white'],
                         help='投影点颜色 (默认: green)')
     return parser.parse_args()
@@ -61,12 +61,17 @@ CAM_NAMES = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
 
 
 def get_ts_from_filename(file_path):
-    """从文件名提取时间戳 (取名字中第一组连续数字)"""
+    """从文件名提取时间戳, 返回微秒级整数.
+
+    文件名格式: n008-2018-08-01-15-16-36-0400__CAM_FRONT__1533151061512404.jpg
+    第一组 "008" 是场景号, 最后一组 "1533151061512404" 才是微秒时间戳。
+    """
     basename = os.path.basename(file_path)
-    match = re.search(r"\d+", basename)
-    if not match:
+    matches = re.findall(r"\d+", basename)
+    if not matches:
         raise ValueError(f"无法从文件名提取时间戳: {basename}")
-    return int(match.group())
+    # 取最后一组 (最长的一组数字 = 微秒时间戳)
+    return int(matches[-1])
 
 
 def detect_cam_from_path(img_path):
@@ -168,7 +173,11 @@ def get_distortion_from_calib(calib_root, cam_name):
 def find_best_frame_from_pkl(infos, cam_name, target_img_ts, max_diff_ms):
     """
     在 pkl 的 infos 列表中, 找到 cam_name 相机的时间戳与 target_img_ts 最接近的帧.
-    优先精确路径匹配, 否则按时间戳二分查找.
+
+    Args:
+        target_img_ts: 目标时间戳 (微秒)
+        max_diff_ms:   最大允许时差 (毫秒)
+
     返回 (frame_idx, info_dict) 或 (None, None).
     """
     # 建立每个帧中 cam_name 相机的时间戳列表
@@ -201,12 +210,13 @@ def find_best_frame_from_pkl(infos, cam_name, target_img_ts, max_diff_ms):
         return None, None
 
     best_ts, best_idx = min(candidates, key=lambda x: abs(x[0] - target_img_ts))
-    diff_ms = abs(best_ts - target_img_ts)
+    # 文件名中时间戳是微秒级, 除以 1000 转换为毫秒后与阈值比较
+    diff_ms = abs(best_ts - target_img_ts) / 1000.0
 
     print(f"\n时间戳匹配:")
-    print(f"  目标图片 ts: {target_img_ts}")
-    print(f"  pkl 最近 ts: {best_ts} (frame[{best_idx}])")
-    print(f"  时差:        {diff_ms} ms (阈值: {max_diff_ms} ms)")
+    print(f"  目标图片 ts (μs): {target_img_ts}")
+    print(f"  pkl 最近 ts  (μs): {best_ts} (frame[{best_idx}])")
+    print(f"  时差:        {diff_ms:.1f} ms (阈值: {max_diff_ms} ms)")
 
     if diff_ms > max_diff_ms:
         print(f"  时差超过阈值 {max_diff_ms}ms, 无匹配帧!")
@@ -233,7 +243,7 @@ def main():
         print(f"ERROR: 图片不存在: {args.img}")
         sys.exit(1)
     target_img_ts = get_ts_from_filename(args.img)
-    print(f"输入图片: {args.img}  (ts={target_img_ts})")
+    print(f"输入图片: {args.img}  (ts={target_img_ts} μs)")
 
     # 自动推断相机名称
     if args.cam is None:
