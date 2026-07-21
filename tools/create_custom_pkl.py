@@ -86,8 +86,8 @@ def parse_args():
     parser.add_argument(
         '--cam-dir-name',
         type=str,
-        default='camera',
-        help='Top-level camera directory name inside data-root (default: camera)')
+        default='image',
+        help='Top-level camera directory name inside data-root (default: image)')
 
     # === 多序列模式参数 ===
     parser.add_argument(
@@ -112,8 +112,8 @@ def parse_args():
     parser.add_argument(
         '--lidar-name',
         type=str,
-        default='top',
-        help='Multi-sequence: which lidar subdir to use under <seq>/lidar/ (default: top)')
+        default='bin_no_self_point',
+        help='Multi-sequence: which lidar subdir to use under <seq>/lidar/ (default: bin_no_self_point)')
     parser.add_argument(
         '--cam-map',
         type=str,
@@ -404,15 +404,17 @@ def load_json_labels(label_dir, coord='flu',
             'Rider': 'motorcycle', 'rider': 'motorcycle',
             'TrafficCone': 'traffic_cone', 'traffic_cone': 'traffic_cone',
             'Barrier': 'barrier', 'barrier': 'barrier',
-            # 新格式 category
-            'cyclist': 'bicycle',
-            'cone': 'traffic_cone',
+            # 新格式 category（自定义数据集类别）
+            'cyclist': 'cyclist',
+            'cone': 'cone',
         }
 
-    # nuScenes 合法类别（不在其中的会被跳过）
+    # 合法类别（不在其中的会被跳过）
+    # 包含 nuScenes 10 类 + 自定义数据额外类别
     VALID_CLASSES = {
         'car', 'truck', 'bus', 'trailer', 'construction_vehicle',
         'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone', 'barrier',
+        'cyclist', 'cone',
     }
 
     frame_labels = {}
@@ -614,6 +616,7 @@ def build_single_frame(data_root, frame_id, cam_names, calib_dir,
     class_to_idx = {
         'car': 0, 'truck': 1, 'construction_vehicle': 2, 'bus': 3, 'trailer': 4,
         'barrier': 5, 'motorcycle': 6, 'bicycle': 7, 'pedestrian': 8, 'traffic_cone': 9,
+        'cyclist': 2, 'cone': 4,
     }
     gt_names = np.array([class_to_idx.get(n, -1) for n in gt_names_str], dtype=np.int64)
     # 过滤掉未知类别
@@ -714,29 +717,61 @@ def _find_nearest_cam_frame(lidar_ts: int, cam_ts_map: dict, max_diff_ms: int = 
     return ''
 
 
-def _find_label_dir_for_seq(label_dir, seq, label_subdir='box_label'):
+def _find_label_dir_for_seq(data_root_seq, label_dir, label_subdir='box_label',
+                            data_dir=None):
     """在多序列标注目录中查找 label 目录。
 
     支持结构：
-      <label_dir>/<seq>/label/<label_subdir>
-      <label_dir>/<record>/<seq>/label/<label_subdir>
+      1. <data_root_seq>/label/<label_subdir>               (label 在序列内部)
+      2. <label_dir>/<seq>/label/<label_subdir>             (label 在独立目录)
+      3. <label_dir>/<record>/<seq>/label/<label_subdir>   (带 record 层)
+      4. <label_dir>/<rel_path_from_data_dir>/label/<label_subdir>  (任意层级镜像)
+      5. 递归搜索 <label_dir> 下任意 record 子目录中的 <seq>/label/<label_subdir>
     """
+    # 优先查找序列内部的 label 目录
+    internal = os.path.join(data_root_seq, 'label', label_subdir)
+    if os.path.isdir(internal):
+        return internal
+
+    # 回退到外部 label_dir
     if not label_dir or not os.path.isdir(label_dir):
+        # 尝试序列内部的 label 目录（无 subdir）
+        internal_fallback = os.path.join(data_root_seq, 'label')
+        if os.path.isdir(internal_fallback):
+            return internal_fallback
         return None
 
-    # 直接结构
-    direct = os.path.join(label_dir, seq, 'label', label_subdir)
+    seq_name = os.path.basename(data_root_seq)
+    record_name = os.path.basename(os.path.dirname(data_root_seq))
+
+    # 直接结构: <label_dir>/<seq>/label/<label_subdir>
+    direct = os.path.join(label_dir, seq_name, 'label', label_subdir)
     if os.path.isdir(direct):
         return direct
 
-    # 搜索 record 子目录
-    for record in sorted(os.listdir(label_dir)):
-        record_path = os.path.join(label_dir, record)
-        if not os.path.isdir(record_path):
-            continue
-        candidate = os.path.join(record_path, seq, 'label', label_subdir)
-        if os.path.isdir(candidate):
-            return candidate
+    # record 子目录: <label_dir>/<record>/<seq>/label/<label_subdir>
+    candidate = os.path.join(label_dir, record_name, seq_name, 'label', label_subdir)
+    if os.path.isdir(candidate):
+        return candidate
+
+    # 任意层级镜像: <label_dir>/<rel_path_from_data_dir>/label/<label_subdir>
+    if data_dir is not None:
+        rel = os.path.relpath(data_root_seq, data_dir)
+        mirror = os.path.join(label_dir, rel, 'label', label_subdir)
+        if os.path.isdir(mirror):
+            return mirror
+
+    # 递归搜索: 在 label_dir 下任意位置找到 <seq>/label/<label_subdir>
+    if os.path.isdir(label_dir):
+        for root, _dirs, _files in os.walk(label_dir):
+            candidate = os.path.join(root, seq_name, 'label', label_subdir)
+            if os.path.isdir(candidate):
+                return candidate
+            # 如果当前目录本身就是 seq，则优先检查当前目录下的 label
+            if os.path.basename(root) == seq_name:
+                candidate2 = os.path.join(root, 'label', label_subdir)
+                if os.path.isdir(candidate2):
+                    return candidate2
     return None
 
 
@@ -763,7 +798,11 @@ def build_sequence_infos(data_root, cam_names, cam_dir_name, calib_dir,
         lidar_abs_dir = os.path.join(data_root, lidar_subdir)
         lidar_rel_dir = lidar_subdir
     if lidar_abs_dir is None:
-        lidar_candidates = ['lidar', 'LIDAR_TOP']
+        lidar_candidates = [
+            'lidar',
+            'LIDAR_TOP',
+            os.path.join('lidar', 'bin_no_self_point'),
+        ]
         for cand in lidar_candidates:
             cand_path = os.path.join(data_root, cand)
             if os.path.isdir(cand_path):
@@ -906,6 +945,39 @@ def build_sequence_infos(data_root, cam_names, cam_dir_name, calib_dir,
     return infos
 
 
+def _is_sequence_dir(path, cam_dir_name, lidar_name):
+    """判断一个目录是否是序列目录（包含 image 和 lidar/<lidar_name> 子目录）。"""
+    return (os.path.isdir(os.path.join(path, cam_dir_name)) and
+            os.path.isdir(os.path.join(path, 'lidar', lidar_name)))
+
+
+def _scan_sequences(data_dir, cam_dir_name, lidar_name):
+    """递归扫描 data_dir 下的所有序列目录。
+
+    支持任意层级嵌套：<batch>/<record>/<sequence>、<record>/<sequence> 或扁平结构。
+    返回 [(record, seq), ...]:
+      - 扁平结构：record=None, seq=<seq>
+      - 嵌套结构：record=<relative_parent>, seq=<seq>
+    """
+    results = []
+    for dirpath, dirnames, _filenames in os.walk(data_dir):
+        rel = os.path.relpath(dirpath, data_dir)
+        if rel == '.':
+            continue
+        # 跳过非序列目录中不需要继续遍历的目录
+        if os.path.basename(rel) in ('calib', 'calibration', 'image', 'lidar', 'label', 'image_undist', 'lidar_rgb', 'lidar_rgb_ply', 'seg_fixed'):
+            dirnames[:] = []
+            continue
+        if _is_sequence_dir(dirpath, cam_dir_name, lidar_name):
+            parent = os.path.dirname(rel)
+            record = parent if parent else None
+            seq = os.path.basename(rel)
+            results.append((record, seq))
+            # 找到序列目录后不再递归进入
+            dirnames[:] = []
+    return sorted(results, key=lambda x: (x[0] or '', x[1]))
+
+
 def _load_cam_map(path):
     if path is None or not os.path.isfile(path):
         return {}
@@ -935,12 +1007,36 @@ def main():
 
     if multi_seq:
         # ====== 多序列模式 ======
-        if not args.calib_dir or not os.path.isdir(args.calib_dir):
-            print(f'ERROR: --calib-dir not found: {args.calib_dir}')
-            sys.exit(1)
-        if not args.label_dir or not os.path.isdir(args.label_dir):
-            print(f'ERROR: --label-dir not found: {args.label_dir}')
-            sys.exit(1)
+        # --calib-dir 自动探测: 优先级
+        #   1) 用户显式指定 --calib-dir
+        #   2) <data-dir>/calib/
+        #   3) <data-dir>/calib/camera/
+        #   4) <parent-of-data-dir>/calib/     (e.g. yk_c1/data -> yk_c1/calib)
+        #   5) <parent-of-data-dir>/calib/camera/
+        #   6) <data-dir>/calibration/
+        #   7) <data-dir>/calibration/camera/
+        if args.calib_dir and os.path.isdir(args.calib_dir):
+            calib_dir = args.calib_dir
+        else:
+            calib_dir = None
+            parent = os.path.dirname(args.data_dir)
+            calib_candidates = [
+                os.path.join(args.data_dir, 'calib'),
+                os.path.join(args.data_dir, 'calib', 'camera'),
+                os.path.join(parent, 'calib'),
+                os.path.join(parent, 'calib', 'camera'),
+                os.path.join(args.data_dir, 'calibration'),
+                os.path.join(args.data_dir, 'calibration', 'camera'),
+            ]
+            for cand in calib_candidates:
+                if os.path.isdir(cand):
+                    calib_dir = cand
+                    print(f'Auto-detected --calib-dir: {calib_dir}')
+                    break
+            if calib_dir is None:
+                print(f'ERROR: --calib-dir not found. Tried: {calib_candidates}. '
+                      f'Specify with --calib-dir.')
+                sys.exit(1)
 
         cam_map_global = _load_cam_map(args.cam_map)
 
@@ -950,96 +1046,81 @@ def main():
         if user_specified:
             for item in args.seq_list:
                 if '/' in item:
-                    parts = item.split('/', 1)
-                    seq_entries.append((parts[0], parts[1]))
+                    # 支持多级路径: batch/record/seq
+                    seq = os.path.basename(item)
+                    record = os.path.dirname(item)
+                    seq_entries.append((record if record else None, seq))
                 else:
-                    seq_name = item
-                    found = None
-                    for entry in sorted(os.listdir(args.data_dir)):
-                        entry_path = os.path.join(args.data_dir, entry)
-                        if not os.path.isdir(entry_path):
-                            continue
-                        if os.path.isdir(os.path.join(entry_path, seq_name)):
-                            found = entry
-                            break
-                    if found:
-                        print(f'Auto-detected record="{found}" for sequence="{seq_name}"')
-                        seq_entries.append((found, seq_name))
-                    else:
-                        print(f'WARNING: cannot find sequence="{seq_name}" under {args.data_dir}, skipping')
+                    seq_entries.append((None, item))
         else:
-            # 自动扫描: 遍历所有 record/sequence 组合
+            # 自动扫描: 支持任意层级嵌套（扁平/record/sequence/batch/record/sequence）
             print(f'Auto-scanning --data-dir: {args.data_dir}')
-            records = sorted(d for d in os.listdir(args.data_dir)
-                           if os.path.isdir(os.path.join(args.data_dir, d)))
-            for record in records:
-                record_path = os.path.join(args.data_dir, record)
-                if not os.path.isdir(record_path):
-                    continue
-                sequences = sorted(d for d in os.listdir(record_path)
-                                  if os.path.isdir(os.path.join(record_path, d)))
-                for seq in sequences:
-                    seq_path = os.path.join(record_path, seq)
-                    has_img = os.path.isdir(os.path.join(seq_path, cam_dir_name))
-                    has_lid = os.path.isdir(os.path.join(seq_path, 'lidar', args.lidar_name))
-                    if has_img and has_lid:
-                        seq_entries.append((record, seq))
-                    else:
-                        img_ok = 'YES' if has_img else 'NO'
-                        lid_ok = 'YES' if has_lid else 'NO'
-                        print(f'  Skip {record}/{seq}: image={img_ok}, lidar/{args.lidar_name}={lid_ok}')
+            seq_entries = _scan_sequences(args.data_dir, cam_dir_name, args.lidar_name)
+            for rec, sq in seq_entries:
+                if rec is None:
+                    print(f'  Detected sequence: {sq}')
+                else:
+                    print(f'  Detected sequence: {rec}/{sq}')
 
         if not seq_entries:
-            print('ERROR: no valid record/sequence found. Check --data-dir layout.')
+            print('ERROR: no valid sequence found. Check --data-dir layout.')
             sys.exit(1)
 
         print(f'\nWill process {len(seq_entries)} sequence(s):')
         for rec, sq in seq_entries:
-            print(f'  {rec}/{sq}')
+            print(f'  {rec}/{sq}' if rec else f'  {sq}')
+
 
         all_infos = []
         for record, seq in seq_entries:
-            # 数据目录: <data-dir>/<record>/<sequence>/
-            data_root_seq = os.path.join(args.data_dir, record, seq)
+            # 数据目录: <data-dir>/<record>/<sequence>/  或  <data-dir>/<sequence>/
+            if record is not None:
+                data_root_seq = os.path.join(args.data_dir, record, seq)
+                lidar_rel_seq = os.path.join('lidar', args.lidar_name)
+                scene_token = f'{record}/{seq}'
+                # token_prefix 不能包含 '/'，否则会影响后续解析
+                token_prefix = f'{record}_{seq}_'.replace('/', '_')
+            else:
+                data_root_seq = os.path.join(args.data_dir, seq)
+                lidar_rel_seq = os.path.join('lidar', args.lidar_name)
+                scene_token = seq
+                token_prefix = f'{seq}_'
+
             if not os.path.isdir(data_root_seq):
                 print(f'WARNING: data dir not found: {data_root_seq}, skipping')
                 continue
 
-            # LiDAR 子目录: <data-dir>/<record>/<seq>/lidar/<lidar-name>/
-            lidar_rel_seq = os.path.join('lidar', args.lidar_name)
+            # LiDAR 子目录
             lidar_abs_seq = os.path.join(data_root_seq, lidar_rel_seq)
             if not os.path.isdir(lidar_abs_seq):
                 print(f'WARNING: lidar dir not found: {lidar_abs_seq}, skipping')
                 continue
 
-            # 标注目录: <label-dir>/<record>/<seq>/label/<label_subdir>/
-            label_dir_seq = os.path.join(
-                args.label_dir, record, seq, 'label', args.label_subdir)
-            if not os.path.isdir(label_dir_seq):
-                label_dir_seq = _find_label_dir_for_seq(
-                    args.label_dir, seq, args.label_subdir)
+            # 标注目录: 优先序列内部的 label/<label_subdir>
+            label_dir_seq = _find_label_dir_for_seq(
+                data_root_seq, args.label_dir, args.label_subdir,
+                data_dir=args.data_dir)
             if not label_dir_seq or not os.path.isdir(label_dir_seq):
-                print(f'WARNING: label dir not found for {record}/{seq}, using None')
+                print(f'WARNING: label dir not found for {scene_token}, using None')
                 label_dir_seq = None
+            else:
+                print(f'Label dir for {scene_token}: {label_dir_seq}')
 
-            # 相机映射: cam_map 的 key 用 sequence 名
-            cam_name_map = cam_map_global.get(seq)
+            # 相机映射
+            lookup_key = seq if record is None else seq
+            cam_name_map = cam_map_global.get(lookup_key)
             if cam_name_map is None:
                 cam_name_map = CAM_PHYSICAL_MAP
-                print(f'Using default camera mapping for {record}/{seq}')
+                print(f'Using default camera mapping for {scene_token}')
             else:
-                print(f'Using custom camera mapping for {record}/{seq}: {cam_name_map}')
+                print(f'Using custom camera mapping for {scene_token}: {cam_name_map}')
 
-            # scene_token 用 record/seq 确保唯一
-            scene_token = f'{record}/{seq}'
-            token_prefix = f'{record}_{seq}_'
-
-            print(f'\n=== Processing: {record}/{seq} ===')
+            print(f'\n=== Processing: {scene_token} ===')
             infos = build_sequence_infos(
                 data_root=data_root_seq,
                 cam_names=cam_names,
                 cam_dir_name=cam_dir_name,
-                calib_dir=args.calib_dir,
+                calib_dir=calib_dir,
                 lidar_calib_path=args.lidar_calib,
                 label_dir=label_dir_seq,
                 coord=args.coord,
@@ -1069,7 +1150,14 @@ def main():
         # ====== 单序列模式（兼容旧版本） ======
         data_root = args.data_root
         calib_dir = args.calib_dir or os.path.join(data_root, 'calib', 'camera')
-        label_dir = args.label_root or os.path.join(data_root, 'label')
+        label_dir = args.label_root
+        if not label_dir:
+            # 自动探测 label 目录
+            internal = os.path.join(data_root, 'label', args.label_subdir)
+            if os.path.isdir(internal):
+                label_dir = internal
+            else:
+                label_dir = os.path.join(data_root, 'label')
         cam_name_map = _load_cam_map(args.cam_map).get('default') or None
 
         infos = build_sequence_infos(
@@ -1084,6 +1172,7 @@ def main():
             scene_token='custom_scene',
             token_prefix='',
             max_cam_ts_diff=100,
+            lidar_subdir=os.path.join('lidar', args.lidar_name),
             calib_coord=args.calib_coord)
 
         dataset = {

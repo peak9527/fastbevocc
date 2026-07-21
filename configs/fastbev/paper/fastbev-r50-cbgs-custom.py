@@ -52,8 +52,8 @@ train_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,            # SUSTechPOINTS 点云: x, y, z, intensity
-        use_dim=4,
+        load_dim=6,            # yk_c1 点云: x, y, z, intensity, ring, padding
+        use_dim=4,             # 取前4维: x, y, z, intensity
         file_client_args=dict(backend='disk')),
     dict(
         type='PointToMultiViewDepth',
@@ -97,7 +97,7 @@ test_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
+        load_dim=6,
         use_dim=4,
         file_client_args=dict(backend='disk')),
     dict(
@@ -140,7 +140,7 @@ share_data_config = dict(
 )
 
 # 训练 / 验证共用一个 pkl（数据量小，建议后续分 train/val）
-ann_file = 'custom_infos_train.pkl'
+ann_file = 'yk_c1_infos_val_3.pkl'
 
 test_data_config = dict(
     pipeline=test_pipeline,
@@ -148,7 +148,7 @@ test_data_config = dict(
 
 data = dict(
     samples_per_gpu=1,          # 自定义数据集帧数少，batch size 用 1
-    workers_per_gpu=2,
+    workers_per_gpu=4,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -168,13 +168,34 @@ for key in ['val', 'test']:
 
 data['train']['dataset'].update(share_data_config)
 data['train']['dataset']['data_root'] = data_root
+# ========== 覆盖 pts_bbox_head 的 tasks，匹配自定义类别 ==========
+# 注意: 必须覆盖 base config 的 pts_bbox_head.tasks，
+# 否则 head 的 class_names 与自定义数据不匹配
+model = dict(
+    pts_bbox_head=dict(
+        tasks=[
+            dict(num_class=10, class_names=[
+                'car', 'truck', 'cyclist', 'bus', 'cone',
+                'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+            ]),
+        ],
+    ),
+    # ========== Backbone 训练模式 ==========
+    # 全量微调: 注释下面 block 即可
+    # img_backbone=dict(
+    #     frozen_stages=4,
+    #     norm_eval=True,
+    #     norm_cfg=dict(type='BN', requires_grad=False),
+    # ),
+)
+
 # ========== 训练设置 ==========
 optimizer = dict(type='AdamW', lr=1e-4, weight_decay=1e-2)
-runner = dict(type='EpochBasedRunner', max_epochs=125)
+optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
+runner = dict(type='EpochBasedRunner', max_epochs=35)
 
 # 禁用继承来的 resume_from，确保从头训练并仅加载预训练权重
-# resume_from = None
+resume_from = None
 # 加载预训练权重 (transfer learning)
-resume_from = 'work_dirs/fastbev-r50-cbgs-custom/latest.pth'
-# load_from = 'work_dirs/fastbev-r50-cbgs-custom/epoch_20_nusenes_ema.pth'
-# load_from = 'data/ckpts/epoch_20_ema.pth'
+# resume_from = 'work_dirs/fastbev-r50-cbgs-custom/latest.pth'
+load_from = 'work_dirs/fastbev-r50-cbgs-custom/epoch_20_nusenes_ema.pth'

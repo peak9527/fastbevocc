@@ -5,8 +5,11 @@ import cv2
 import mmcv
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from pyquaternion import Quaternion
+
+# 允许加载截断/损坏的图片，避免训练因数据质量问题中断
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from mmdet3d.core.points import BasePoints, get_points_type
 from mmdet.datasets.pipelines import LoadAnnotations, LoadImageFromFile
