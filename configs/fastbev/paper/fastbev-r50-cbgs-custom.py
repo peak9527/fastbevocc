@@ -35,6 +35,14 @@ bda_aug_conf = dict(
     flip_dx_ratio=0.5,
     flip_dy_ratio=0.5)
 
+# class_names 顺序必须与 base config (fastbev-r50-cbgs.py) 严格一致
+# 注意: mmcv 的 _base_ 仅合并 dict，不会注入 Python 变量，
+# 所以 class_names 必须在本文件内定义（且必须在 pipeline 之前，否则 NameError）。
+class_names = [
+    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+]
+
 # ========== 训练 pipeline ==========
 train_pipeline = [
     dict(
@@ -45,10 +53,7 @@ train_pipeline = [
     dict(
         type='BEVAug',
         bda_aug_conf=bda_aug_conf,
-        classes=[
-            'car', 'truck', 'cyclist', 'bus', 'cone',
-            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-        ]),
+        classes=class_names),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -68,16 +73,10 @@ train_pipeline = [
         point_cloud_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]),
     dict(
         type='ObjectNameFilter',
-        classes=[
-            'car', 'truck', 'cyclist', 'bus', 'cone',
-            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-        ]),
+        classes=class_names),
     dict(
         type='DefaultFormatBundle3D',
-        class_names=[
-            'car', 'truck', 'cyclist', 'bus', 'cone',
-            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-        ]),
+        class_names=class_names),
     dict(
         type='Collect3D',
         keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_depth'])
@@ -89,10 +88,7 @@ test_pipeline = [
     dict(type='LoadAnnotations'),
     dict(type='BEVAug',
          bda_aug_conf=bda_aug_conf,
-         classes=[
-            'car', 'truck', 'cyclist', 'bus', 'cone',
-            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-         ],
+         classes=class_names,
          is_train=False),
     dict(
         type='LoadPointsFromFile',
@@ -108,10 +104,7 @@ test_pipeline = [
         transforms=[
             dict(
                 type='DefaultFormatBundle3D',
-                class_names=[
-                    'car', 'truck', 'cyclist', 'bus', 'cone',
-                    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-                ],
+                class_names=class_names,
                 with_label=False),
             dict(type='Collect3D', keys=['points', 'img_inputs'])
         ])
@@ -119,10 +112,6 @@ test_pipeline = [
 
 # ========== 数据集配置 ==========
 dataset_type = 'NuScenesDataset'
-class_names = [
-    'car', 'truck', 'cyclist', 'bus', 'cone',
-    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-]
 
 input_modality = dict(
     use_lidar=False,
@@ -140,7 +129,7 @@ share_data_config = dict(
 )
 
 # 训练 / 验证共用一个 pkl（数据量小，建议后续分 train/val）
-ann_file = 'yk_c1_infos_val_3.pkl'
+ann_file = 'yk_c1_infos_train.pkl'
 
 test_data_config = dict(
     pipeline=test_pipeline,
@@ -168,34 +157,18 @@ for key in ['val', 'test']:
 
 data['train']['dataset'].update(share_data_config)
 data['train']['dataset']['data_root'] = data_root
-# ========== 覆盖 pts_bbox_head 的 tasks，匹配自定义类别 ==========
-# 注意: 必须覆盖 base config 的 pts_bbox_head.tasks，
-# 否则 head 的 class_names 与自定义数据不匹配
-model = dict(
-    pts_bbox_head=dict(
-        tasks=[
-            dict(num_class=10, class_names=[
-                'car', 'truck', 'cyclist', 'bus', 'cone',
-                'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
-            ]),
-        ],
-    ),
-    # ========== Backbone 训练模式 ==========
-    # 全量微调: 注释下面 block 即可
-    # img_backbone=dict(
-    #     frozen_stages=4,
-    #     norm_eval=True,
-    #     norm_cfg=dict(type='BN', requires_grad=False),
-    # ),
-)
+# pts_bbox_head 继承自 base config，class_names 与 base 一致，无需覆盖
+# 如需冻结 backbone，取消注释下面两行:
+# model = dict(img_backbone=dict(frozen_stages=4, norm_eval=True,
+#                                norm_cfg=dict(type='BN', requires_grad=False)))
 
 # ========== 训练设置 ==========
 optimizer = dict(type='AdamW', lr=1e-4, weight_decay=1e-2)
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
-runner = dict(type='EpochBasedRunner', max_epochs=35)
+runner = dict(type='EpochBasedRunner', max_epochs=25)
 
 # 禁用继承来的 resume_from，确保从头训练并仅加载预训练权重
 resume_from = None
 # 加载预训练权重 (transfer learning)
-# resume_from = 'work_dirs/fastbev-r50-cbgs-custom/latest.pth'
-load_from = 'work_dirs/fastbev-r50-cbgs-custom/epoch_20_nusenes_ema.pth'
+# resume_from = 'work_dirs/yk_c1_exp1/latest.pth'
+load_from = 'work_dirs/fastbev-r50-cbgs-custom/epoch_20_ema.pth'

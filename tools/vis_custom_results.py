@@ -227,12 +227,14 @@ def main():
     # nuScenes 数据: 预测在 global frame, 需要 π/2 偏移
     is_custom = _is_ego2global_identity(infos_list)
     if is_custom:
-        print('Dataset: custom (ego2global = identity, predictions in ego frame)')
+        print('Dataset: custom (ego2global = identity, preds/GT both in LiDAR frame)')
         yaw_offset = 0.0
+        use_lidar_frame = True  # pred boxes are already in LiDAR frame, skip l2g transform
         print(f'Using yaw_offset = {yaw_offset:.4f} (FLU convention: 0 = forward)')
     else:
         print('Dataset: nuScenes (ego2global varies, predictions in global frame)')
         yaw_offset = args.yaw_offset
+        use_lidar_frame = False
         print(f'Using --yaw-offset: {yaw_offset:.4f}')
     # -----------------------------------------
 
@@ -273,6 +275,13 @@ def main():
         # results_nusc.json format (nuScenes): [x,y,z], size=[w,l,h], rotation=quat
         # mmdet3d LiDARInstance3DBoxes expects [x,y,z, x_size, y_size, z_size, yaw]
         # where x_size corresponds to nuScenes length (l), y_size to width (w).
+        #
+        # 注意: CenterPoint/FastBEV 在生成 results_nusc.json 时，
+        # 模型预测的是 gravity-center z，但 get_bboxes() 里会错误地
+        # 把 z 减去 h/2 再写入 translation[2]。
+        # 因此这里的 pred z 是 gravity_center - h/2，比真实 center 偏低 h/2。
+        # 需要在下方加回 h/2 恢复 gravity_center，再用 origin=(0.5,0.5,0.5) 解析。
+        # GT (SUSTechPOINTS psr.position) 是 gravity-center，同样用 0.5。
         pred_res = res['results'].get(token, [])
         pred_boxes = []
         for rid in range(len(pred_res)):
@@ -289,15 +298,41 @@ def main():
             corners_lidar = np.zeros((0, 3), dtype=np.float32)
         else:
             pred_boxes = np.array(pred_boxes, dtype=np.float32)
+            # 补偿 get_bboxes() 中多余的 z - h/2 操作:
+            # get_bboxes() (centerpoint_head.py line 751) 把 z 减去 h/2，
+            # 将模型预测的 gravity_center 转成 bottom_center 写入 results_nusc.json。
+            # 这里加回 h/2 恢复 gravity_center，再用 origin=0.5 正确解析。
+            pred_boxes[:, 2] = pred_boxes[:, 2] + pred_boxes[:, 5] * 0.5
             boxes = LB(pred_boxes, origin=(0.5, 0.5, 0.5))
-            corners_global = boxes.corners.numpy().reshape(-1, 3)
-            corners_global = np.concatenate(
-                [corners_global,
-                 np.ones([corners_global.shape[0], 1])],
-                axis=1)
-            l2g = get_lidar2global(infos)
-            corners_lidar = corners_global @ np.linalg.inv(l2g).T
-            corners_lidar = corners_lidar[:, :3]
+
+            # DEBUG: 打印首位预测框的 z 诊断信息
+            if len(pred_boxes) > 0:
+                pb = pred_boxes[0]
+                gt_b = infos.get('gt_boxes')
+                print(f'\n[DEBUG frame={cnt}] Pred box0: z_bottom={pb[2]:.3f},'
+                      f' h={pb[5]:.3f}, z_top={pb[2]+pb[5]:.3f},'
+                      f' l={pb[3]:.3f}, w={pb[4]:.3f}')
+                if gt_b is not None and len(gt_b) > 0:
+                    gb = gt_b[0]
+                    print(f'[DEBUG frame={cnt}] GT   box0: z_gravity={gb[2]:.3f},'
+                          f' h={gb[5]:.3f}, z_bottom_gt={gb[2]-gb[5]*0.5:.3f},'
+                          f' z_top_gt={gb[2]+gb[5]*0.5:.3f},'
+                          f' l={gb[3]:.3f}, w={gb[4]:.3f}')
+                    print(f'[DEBUG frame={cnt}] z_bottom_diff: {pb[2] - (gb[2]-gb[5]*0.5):.4f}m,'
+                          f' z_top_diff: {(pb[2]+pb[5]) - (gb[2]+gb[5]*0.5):.4f}m')
+            corners_tmp = boxes.corners.numpy().reshape(-1, 3)
+            if not use_lidar_frame:
+                # nuScenes: pred boxes are in global frame, convert back to LiDAR
+                corners_tmp = np.concatenate(
+                    [corners_tmp,
+                     np.ones([corners_tmp.shape[0], 1])],
+                    axis=1)
+                l2g = get_lidar2global(infos)
+                corners_lidar = corners_tmp @ np.linalg.inv(l2g).T
+                corners_lidar = corners_lidar[:, :3]
+            else:
+                # custom: pred boxes (and GT) are already in LiDAR frame
+                corners_lidar = corners_tmp
 
         pred_flag = np.ones((corners_lidar.shape[0] // 8, ), dtype=bool)
         scores = [
@@ -376,7 +411,7 @@ def main():
         if lidar_path and os.path.exists(lidar_path):
             lidar_points = np.fromfile(lidar_path, dtype=np.float32)
             try:
-                for dim in [4, 5, 6, 3]:
+                for dim in [6, 4, 5, 3]:
                     if lidar_points.size % dim == 0:
                         lidar_points = lidar_points.reshape(-1, dim)
                         break
