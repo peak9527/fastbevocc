@@ -50,13 +50,42 @@ python tools/analysis_tools/vis.py work_dirs/fastbev-r50-cbgs/results/pts_bbox/r
   --show-range 50 --vis-thred 0.3 --draw-gt --format video --fps 10
 ```
 ## 使用自定义数据进行推理和可视化
-test script:
+1、自定义数据生成pkl文件:
 
 ```shell
-./tools/dist_test.sh configs/fastbev/paper/fastbev-r50-cbgs.py work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth 8 --eval mAP 2>&1 | tee work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth.log
+python tools/create_custom_pkl.py \
+  --data-dir data/custom_data/yk_c1/data \
+  --lidar-calib data/custom_data/yk_c1/calib/lidar/helios32_top_vehicle_extrinsics.yaml \
+  --calib-dir data/custom_data/yk_c1/calib/camera \
+  --output yk_c1_infos_val.pkl
+```
+2、训练自定义数据:
+
+```shell
+./tools/dist_train.sh configs/fastbev/paper/fastbev-r50-cbgs-custom.py 2
 ```
 
+3、训练自定义数据:
 
+```shell
+./tools/dist_test.sh configs/fastbev/paper/fastbev-r50-cbgs-custom.py \
+  work_dirs/fastbev-r50-cbgs-custom/latest.pth 2 \
+  --format-only \
+  --eval-options 'jsonfile_prefix=work_dirs/fastbev-r50-cbgs-custom/results_custom'
+```
+
+4、可视化推理结果:
+
+```shell
+ python tools/vis_custom_results.py \
+  work_dirs/fastbev-r50-cbgs-custom/results_custom/pts_bbox/results_nusc.json \
+  --pkl custom_infos_train.pkl \
+  --save-path work_dirs/fastbev-r50-cbgs-custom/vis_custom_v1 \
+  --show-range 50 --vis-thred 0.3 --draw-gt \
+  --format video --fps 2
+```
+可视化结果如下：
+![alt text](image.png)
 ## Main Results
 
 ![](./resources/fastbev++_exps.jpg)
