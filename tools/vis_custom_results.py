@@ -306,20 +306,20 @@ def main():
             boxes = LB(pred_boxes, origin=(0.5, 0.5, 0.5))
 
             # DEBUG: 打印首位预测框的 z 诊断信息
-            if len(pred_boxes) > 0:
-                pb = pred_boxes[0]
-                gt_b = infos.get('gt_boxes')
-                print(f'\n[DEBUG frame={cnt}] Pred box0: z_bottom={pb[2]:.3f},'
-                      f' h={pb[5]:.3f}, z_top={pb[2]+pb[5]:.3f},'
-                      f' l={pb[3]:.3f}, w={pb[4]:.3f}')
-                if gt_b is not None and len(gt_b) > 0:
-                    gb = gt_b[0]
-                    print(f'[DEBUG frame={cnt}] GT   box0: z_gravity={gb[2]:.3f},'
-                          f' h={gb[5]:.3f}, z_bottom_gt={gb[2]-gb[5]*0.5:.3f},'
-                          f' z_top_gt={gb[2]+gb[5]*0.5:.3f},'
-                          f' l={gb[3]:.3f}, w={gb[4]:.3f}')
-                    print(f'[DEBUG frame={cnt}] z_bottom_diff: {pb[2] - (gb[2]-gb[5]*0.5):.4f}m,'
-                          f' z_top_diff: {(pb[2]+pb[5]) - (gb[2]+gb[5]*0.5):.4f}m')
+            # if len(pred_boxes) > 0:
+            #     pb = pred_boxes[0]
+            #     gt_b = infos.get('gt_boxes')
+            #     print(f'\n[DEBUG frame={cnt}] Pred box0: z_bottom={pb[2]:.3f},'
+            #           f' h={pb[5]:.3f}, z_top={pb[2]+pb[5]:.3f},'
+            #           f' l={pb[3]:.3f}, w={pb[4]:.3f}')
+            #     if gt_b is not None and len(gt_b) > 0:
+            #         gb = gt_b[0]
+            #         print(f'[DEBUG frame={cnt}] GT   box0: z_gravity={gb[2]:.3f},'
+            #               f' h={gb[5]:.3f}, z_bottom_gt={gb[2]-gb[5]*0.5:.3f},'
+            #               f' z_top_gt={gb[2]+gb[5]*0.5:.3f},'
+            #               f' l={gb[3]:.3f}, w={gb[4]:.3f}')
+            #         print(f'[DEBUG frame={cnt}] z_bottom_diff: {pb[2] - (gb[2]-gb[5]*0.5):.4f}m,'
+            #               f' z_top_diff: {(pb[2]+pb[5]) - (gb[2]+gb[5]*0.5):.4f}m')
             corners_tmp = boxes.corners.numpy().reshape(-1, 3)
             if not use_lidar_frame:
                 # nuScenes: pred boxes are in global frame, convert back to LiDAR

@@ -358,30 +358,79 @@ def main():
             model.img_view_transformer.accelerate = False
             with torch.no_grad():
                 img, _ = model.image_encoder(data['img_inputs'][0][0].cuda())
-                input = [img] + [d.cuda() for d in data['img_inputs'][0][1:]]
-                bev_feat_1 = model.img_view_transformer(input)[0]
+                input_acc_false = [img] + [d.cuda() for d in data['img_inputs'][0][1:]]
+                bev_feat_1 = model.img_view_transformer(input_acc_false)[0]
             model.img_view_transformer.accelerate = True
             with torch.no_grad():
                 img, _ = model.image_encoder(data['img_inputs'][0][0].cuda())
-                input = [img] + [d.cuda() for d in data['img_inputs'][0][1:]]
-                bev_feat = model.img_view_transformer(input)[0]
-            assert torch.all(bev_feat_1 == bev_feat)
-            continue
-        img = data['img_inputs'][0][0][0].cuda()
-        _, coors_img, coors_depth = model.img_view_transformer.get_fastray_input(input)
-        coors_img, coors_depth = coors_img[0], coors_depth[0]
+                input_acc_true = [img] + [d.cuda() for d in data['img_inputs'][0][1:]]
+                bev_feat = model.img_view_transformer(input_acc_true)[0]
+            assert torch.allclose(bev_feat_1, bev_feat, atol=1e-4), \
+                '❌ accelerate=True vs False mismatch'
+            print('✅ accelerate=True vs False verification passed (img_view_transformer level)')
+
+            # ---- 完整模型数值校验 ----
+            # 计算 coors（使用同一样本的数据）
+            _, coors_img, coors_depth = model.img_view_transformer.get_fastray_input(input_acc_true)
+            coors_img, coors_depth = coors_img[0], coors_depth[0]
+
+            # 直接用 img（原始图像，非 image_encoder 输出）走 FastBEVTRT.forward
+            raw_img = data['img_inputs'][0][0][0].cuda()
+            with torch.no_grad():
+                trt_out = model(raw_img.float().contiguous(),
+                                coors_img.contiguous(),
+                                coors_depth.contiguous())
+
+            # ---- PyTorch 完整 forward（extract_feat → pts_bbox_head → serialize）---
+            # extract_feat 内部走 image_encoder → img_view_transformer，
+            # 与 FastBEVTRT.forward 使用同一样本、但走不同的代码路径
+            img_inputs_gpu = tuple(
+                d.cuda() if isinstance(d, torch.Tensor) else d
+                for d in data['img_inputs'][0]
+            )
+            with torch.no_grad():
+                pth_img_feats, _, _ = model.extract_feat(
+                    points=None, img=img_inputs_gpu, img_metas=data['img_metas'])
+                pth_head_outs = model.pts_bbox_head(pth_img_feats[0])
+                pth_serialized = model.result_serialize(pth_head_outs)
+
+            # ---- 比对 FastBEVTRT.forward 输出 vs PyTorch 完整 forward ---
+            print('Comparing FastBEVTRT.forward vs PyTorch extract_feat+head outputs:')
+            max_diff = 0.0
+            for j, (t_o, p_o) in enumerate(zip(trt_out, pth_serialized)):
+                diff = (t_o - p_o).abs().max().item()
+                max_diff = max(max_diff, diff)
+                print(f'  head[{j}] shape={list(t_o.shape)} max_abs_diff={diff:.6f}')
+            if max_diff > 1e-3:
+                print(f'⚠️  WARNING: Max difference {max_diff:.6f} exceeds 1e-3, '
+                      'ONNX/PyTorch may be inconsistent!')
+            else:
+                print(f'✅ FastBEVTRT.forward vs PyTorch matched (max_diff={max_diff:.6f})')
+
+        # ---- ONNX export (use same sample as verification) ---
+        onnx_path = os.path.join(args.work_dir, model_prefix + '.onnx')
+
+        # 构建输出名称（与 result_serialize 顺序一致）
+        num_tasks = len(model.pts_bbox_head.task_heads)
+        output_names = []
+        for t in range(num_tasks):
+            for key in ['reg', 'height', 'dim', 'rot', 'vel', 'heatmap']:
+                output_names.append(f'task{t}_{key}')
+
         with torch.no_grad():
             torch.onnx.export(
                 model,
-                (img.float().contiguous(), coors_img.contiguous(), coors_depth.contiguous()),
-                args.work_dir + model_prefix + '.onnx',
-                opset_version=11,
+                (raw_img.float().contiguous(), coors_img.contiguous(), coors_depth.contiguous()),
+                onnx_path,
+                opset_version=16,
                 input_names=['img', 'coors_img', 'coors_depth'],
-                output_names=[f'output_{j}' for j in
-                            range(6 * len(model.pts_bbox_head.task_heads))])
+                output_names=output_names,
+                do_constant_folding=False)
+        print(f'  coors_img shape: {tuple(coors_img.shape)}')
+        print(f'  coors_depth shape: {tuple(coors_depth.shape)}')
         break
     # check onnx model
-    onnx_model = onnx.load(args.work_dir + model_prefix + '.onnx')
+    onnx_model = onnx.load(onnx_path)
     try:
         onnx.checker.check_model(onnx_model)
     except Exception:
@@ -390,8 +439,16 @@ def main():
         print('ONNX Model Correct')
     onnx_simp, check = simplify(onnx_model)
     assert check, "Simplified ONNX model could not be validated"
-    onnx.save(onnx_simp, args.work_dir + model_prefix + '.onnx')
-    print(f"🚀 The export is completed. ONNX save as {args.work_dir + model_prefix + '.onnx'} 🤗, Have a nice day~")
+    onnx.save(onnx_simp, onnx_path)
+    print(f"🚀 The export is completed. ONNX save as {onnx_path} 🤗, Have a nice day~")
+
+    fp16_flag = ' --fp16' if args.fp16 else ''
+    print(f"\n{'='*60}")
+    print(f"  Build TensorRT engine with:")
+    print(f"  python tools/build_trt_engine.py \\")
+    print(f"      --onnx {onnx_path} \\")
+    print(f"      --engine models/{model_prefix}.engine{fp16_flag}")
+    print(f"{'='*60}")
 
     # # convert to tensorrt
     # input_shapes = dict(

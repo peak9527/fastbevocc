@@ -40,7 +40,8 @@ bda_aug_conf = dict(
 # 所以 class_names 必须在本文件内定义（且必须在 pipeline 之前，否则 NameError）。
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
-    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone',
+    'trunk', 'fence'
 ]
 
 # ========== 训练 pipeline ==========
@@ -129,7 +130,7 @@ share_data_config = dict(
 )
 
 # 训练 / 验证共用一个 pkl（数据量小，建议后续分 train/val）
-ann_file = 'yk_c1_infos_train.pkl'
+ann_file = 'yk_c1_infos_train1.pkl'
 
 test_data_config = dict(
     pipeline=test_pipeline,

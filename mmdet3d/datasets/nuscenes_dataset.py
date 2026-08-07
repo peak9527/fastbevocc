@@ -90,6 +90,8 @@ class NuScenesDataset(Custom3DDataset):
         'bicycle': 'cycle.without_rider',
         'barrier': '',
         'traffic_cone': '',
+        'trunk': '',
+        'fence': '',
     }
     AttrMapping = {
         'cycle.with_rider': 0,

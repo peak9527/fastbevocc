@@ -197,16 +197,15 @@ class FastrayTransformer(BaseModule):
             if self.accelerate:
                 assert batch_size == 1, batch_size
                 assert self.use_depth, self.use_depth
-                new_img_indices = []
-                new_depth_indices = []
-                N = pre_img_coors_list.shape[0]
-                for idx in range(N):
-                    fc, fh, fw = pre_img_coors_list[idx]
-                    fd = pre_depth_coors_list[idx]
-                    new_img_indices.append(fc * (height * width) + fh * width + fw)
-                    new_depth_indices.append((fc * (height * width) + fh * width + fw) * self.D + fd)
-                pre_img_coors_list = torch.Tensor(new_img_indices).long().to(pre_img_coors_list.device)
-                pre_depth_coors_list = torch.Tensor(new_depth_indices).long().to(pre_img_coors_list.device)
+                # Vectorized index computation (avoid O(N) Python for-loop):
+                #   pre_img_coors_list: [N, 3] (fc, fh, fw) -> [N] linear
+                #   pre_depth_coors_list: [N] fd -> [N] linear
+                fc = pre_img_coors_list[:, 0]
+                fh = pre_img_coors_list[:, 1]
+                fw = pre_img_coors_list[:, 2]
+                img_linear = fc * (height * width) + fh * width + fw
+                pre_img_coors_list = img_linear.long()
+                pre_depth_coors_list = (img_linear * self.D + pre_depth_coors_list).long()
 
                 # sort by voxel coor
                 pre_voxel_coors_list, sort_idx = pre_voxel_coors_list.sort()

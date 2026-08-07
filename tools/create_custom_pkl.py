@@ -405,14 +405,19 @@ def load_json_labels(label_dir, coord='flu',
             'TrafficCone': 'traffic_cone', 'traffic_cone': 'traffic_cone',
             'Barrier': 'barrier', 'barrier': 'barrier',
             # 新格式 category（自定义类别 → nuScenes 标准类别）
-            'cyclist': 'bicycle',
+            'cyclist': 'motorcycle', 'tricycle': 'motorcycle', 'other non-motor vehicle': 'motorcycle',
             'cone': 'traffic_cone',
+            'special_vehicle': 'construction_vehicle',
+            # 自定义类别（trunk/fence → 目标类别）
+            'Trunk': 'trunk', 'trunk': 'trunk',
+            'Fence': 'fence', 'fence': 'fence',
         }
 
     # 合法类别（不在其中的会被跳过）
     VALID_CLASSES = {
         'car', 'truck', 'bus', 'trailer', 'construction_vehicle',
         'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone', 'barrier',
+        'trunk', 'fence',
     }
 
     frame_labels = {}
@@ -616,6 +621,7 @@ def build_single_frame(data_root, frame_id, cam_names, calib_dir,
     class_to_idx = {
         'car': 0, 'truck': 1, 'construction_vehicle': 2, 'bus': 3, 'trailer': 4,
         'barrier': 5, 'motorcycle': 6, 'bicycle': 7, 'pedestrian': 8, 'traffic_cone': 9,
+        'trunk': 10, 'fence': 11,
     }
     gt_names = np.array([class_to_idx.get(n, -1) for n in gt_names_str], dtype=np.int64)
     # 过滤掉未知类别

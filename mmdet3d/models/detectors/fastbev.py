@@ -522,6 +522,10 @@ class FastBEVTRT(FastBEV):
 
         if channel != self.img_view_transformer.out_channels:
             depth = img[:, :self.img_view_transformer.D].reshape(-1)
+            if self.img_view_transformer.depth_act == 'sigmoid':
+                depth = depth.sigmoid()
+            else:
+                depth = depth.softmax(dim=-1)
             x = img[:, self.img_view_transformer.D:(self.img_view_transformer.D + self.img_view_transformer.out_channels)]
             x = x[coors_img]
             depth = depth[coors_depth].unsqueeze(1)
