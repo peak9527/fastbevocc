@@ -31,7 +31,6 @@ point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone',
-    'trunk', 'fence'
 ]
 
 data_config = {
@@ -107,13 +106,13 @@ model = dict(
         type='CenterHead',
         in_channels=256,
         tasks=[
-            dict(num_class=12, class_names=['car', 'truck',
+            dict(num_class=10, class_names=['car', 'truck',
                                             'construction_vehicle',
                                             'bus', 'trailer',
                                             'barrier',
                                             'motorcycle', 'bicycle',
                                             'pedestrian', 'traffic_cone',
-                                            'trunk', 'fence']),
+                                            ]),
         ],
         common_heads=dict(
             reg=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
