@@ -561,3 +561,99 @@ class FastBEVTRT(FastBEV):
         coor = self.img_view_transformer.get_lidar_coor(*input[1:7])
         return self.img_view_transformer.voxel_pooling_prepare_v2(coor)
 
+
+@DETECTORS.register_module()
+class FastBEVOCC(FastBEV):
+    r"""FastBEV with an extra occupancy head (FlashOCC style).
+
+    在 FastBEV 3D 目标检测的基础上，额外挂接语义占用头（FastBEVOCCHead），
+    训练时同时优化检测损失与占用损失；测试时同时输出 BEV 3D 目标检测结果
+    （pts_bbox）和语义占用栅格（occ）。
+
+    Args:
+        occ_head (dict | None): Configuration dict of the occupancy head.
+    """
+
+    def __init__(self, occ_head=None, init_cfg=None, **kwargs):
+        super(FastBEVOCC, self).__init__(init_cfg=init_cfg, **kwargs)
+        self.occ_head = None
+        if occ_head is not None:
+            self.occ_head = builder.build_head(occ_head)
+
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img_inputs=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None,
+                      **kwargs):
+        """Forward training function.
+
+        Returns:
+            dict: Losses of detection branch, depth branch (if use_depth)
+                and occupancy branch (if occ_head is not None).
+        """
+        img_feats, pts_feats, depth = self.extract_feat(
+            points, img=img_inputs, img_metas=img_metas, **kwargs)
+        if self.use_depth:
+            gt_depth = kwargs['gt_depth']
+            loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
+            losses = dict(loss_depth=loss_depth)
+        else:
+            losses = dict()
+        losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
+                                            gt_labels_3d, img_metas,
+                                            gt_bboxes_ignore)
+        losses.update(losses_pts)
+        if self.occ_head is not None:
+            voxel_semantics = kwargs['voxel_semantics']
+            mask_camera = kwargs['mask_camera']
+            occ_pred = self.occ_head(img_feats[0])
+            losses_occ = self.occ_head.loss(occ_pred, voxel_semantics,
+                                            mask_camera)
+            losses.update(losses_occ)
+        return losses
+
+    def simple_test(self,
+                    points,
+                    img_metas,
+                    img=None,
+                    rescale=False,
+                    **kwargs):
+        """Test function without augmentation.
+
+        Returns:
+            list[dict]: Each dict contains 'pts_bbox' (3D object detection
+                results) and 'occ' (occupancy prediction, shape (Dx, Dy, Dz)).
+        """
+        img_feats, _, _ = self.extract_feat(
+            points, img=img, img_metas=img_metas, **kwargs)
+        bbox_list = [dict() for _ in range(len(img_metas))]
+        bbox_pts = self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
+            result_dict['pts_bbox'] = pts_bbox
+        if self.occ_head is not None:
+            occ_pred = self.occ_head(img_feats[0])
+            occ_res = self.occ_head.get_occ(occ_pred)
+            for result_dict, occ in zip(bbox_list, occ_res):
+                result_dict['occ'] = occ
+        return bbox_list
+
+    def forward_dummy(self,
+                      points=None,
+                      img_metas=None,
+                      img_inputs=None,
+                      **kwargs):
+        img_feats, _, _ = self.extract_feat(
+            points, img=img_inputs, img_metas=img_metas, **kwargs)
+        assert self.with_pts_bbox
+        outs = self.pts_bbox_head(img_feats)
+        if self.occ_head is not None:
+            occ_pred = self.occ_head(img_feats[0])
+            return [outs, occ_pred]
+        return outs
+

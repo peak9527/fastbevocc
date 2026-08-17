@@ -61,6 +61,17 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
         return input_dict
 
     def evaluate(self, occ_results, runner=None, show_dir=None, **eval_kwargs):
+        # 兼容 FastBEVOCC 同时输出检测与占用的结果形式：
+        # results 为 list[dict]，每个 dict 含 'pts_bbox' 与 'occ'；
+        # 此时分离出 occ 结果并额外做 3D 目标检测评估。
+        det_results = None
+        if (isinstance(occ_results, (list, tuple)) and len(occ_results) > 0
+                and isinstance(occ_results[0], dict)):
+            det_results = [
+                dict(pts_bbox=result['pts_bbox']) for result in occ_results
+            ]
+            occ_results = [result['occ'] for result in occ_results]
+
         self.occ_eval_metrics = Metric_mIoU(
             num_classes=18,
             use_lidar_mask=False,
@@ -83,7 +94,13 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
                 mmcv.imwrite(np.concatenate([gt_vis, pred_vis], axis=1),
                              os.path.join(show_dir + "%d.jpg"%index))
 
-        return self.occ_eval_metrics.count_miou()
+        occ_metrics = self.occ_eval_metrics.count_miou()
+
+        if det_results is not None:
+            det_metrics = NuScenesDataset.evaluate(self, det_results,
+                                                   **eval_kwargs)
+            return {**occ_metrics, **det_metrics}
+        return occ_metrics
 
     def vis_occ(self, semantics):
         # simple visualization of result in BEV

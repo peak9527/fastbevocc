@@ -207,7 +207,7 @@ custom_hooks = [
 ]
 
 # 禁用继承来的 resume_from，确保从头训练并仅加载预训练权重
-resume_from = None
+# resume_from = None
 # 加载预训练权重 (transfer learning)
-# resume_from = 'work_dirs/yk_c1_exp1/latest.pth'
-load_from = 'data/ckpts/epoch_20_ema.pth'
+resume_from = 'work_dirs/fastbev-r50-cbgs-custom/latest.pth'
+# load_from = 'data/ckpts/epoch_20_ema.pth'
