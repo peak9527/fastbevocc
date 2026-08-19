@@ -566,19 +566,59 @@ class FastBEVTRT(FastBEV):
 class FastBEVOCC(FastBEV):
     r"""FastBEV with an extra occupancy head (FlashOCC style).
 
-    在 FastBEV 3D 目标检测的基础上，额外挂接语义占用头（FastBEVOCCHead），
+    在 FastBEV 3D 目标检测的基础上，额外挂接语义占用头（FastBEVOCCHead）。
     训练时同时优化检测损失与占用损失；测试时同时输出 BEV 3D 目标检测结果
     （pts_bbox）和语义占用栅格（occ）。
 
+    支持方案 B（freeze_det_branch=True）：冻结检测分支
+    （backbone/neck/view_transformer/bev_encoder/pts_bbox_head），
+    只训练 occ_head（final_conv + predicter）去适配 FastBEV 的 BEV 特征空间。
+    此时训练前向中检测分支在 no_grad 下运行（省显存/加速），且只计算
+    occ 损失，检测分支参数完全不被更新。
+
     Args:
         occ_head (dict | None): Configuration dict of the occupancy head.
+        freeze_det_branch (bool): Whether to freeze the detection branch and
+            train the occupancy head only (方案 B). Defaults to False.
     """
 
-    def __init__(self, occ_head=None, init_cfg=None, **kwargs):
+    def __init__(self,
+                 occ_head=None,
+                 init_cfg=None,
+                 freeze_det_branch=False,
+                 **kwargs):
         super(FastBEVOCC, self).__init__(init_cfg=init_cfg, **kwargs)
         self.occ_head = None
         if occ_head is not None:
             self.occ_head = builder.build_head(occ_head)
+        self.freeze_det_branch = freeze_det_branch
+        if freeze_det_branch:
+            self._freeze_det_branch()
+
+    def _freeze_det_branch(self):
+        """方案 B：冻结检测分支，仅保留 occ_head（final_conv + predicter）可训练。
+
+        除 occ_head 外的所有参数（img_backbone / img_neck /
+        img_view_transformer / img_bev_encoder_* / pts_bbox_head）均置为
+        requires_grad=False。结合 RequiresGradOptimizerConstructor，优化器
+        只会包含 occ_head 的参数。
+        """
+        for name, param in self.named_parameters():
+            if name.startswith('occ_head.'):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+    def train(self, mode=True):
+        """冻结模式下保持检测分支的 BN 为 eval，避免 running stats 被更新。"""
+        super(FastBEVOCC, self).train(mode)
+        if self.freeze_det_branch and mode:
+            from torch.nn.modules.batchnorm import _BatchNorm
+            for name, module in self.named_modules():
+                if name.startswith('occ_head'):
+                    continue
+                if isinstance(module, _BatchNorm):
+                    module.eval()
 
     def forward_train(self,
                       points=None,
@@ -597,6 +637,22 @@ class FastBEVOCC(FastBEV):
             dict: Losses of detection branch, depth branch (if use_depth)
                 and occupancy branch (if occ_head is not None).
         """
+        if self.freeze_det_branch:
+            # 方案 B：检测分支已冻结。BEV 特征提取整体在 no_grad 下完成
+            # （不需要保存检测分支的中间激活，省显存/加速），只计算 occ 损失。
+            with torch.no_grad():
+                img_feats, _, _ = self.extract_feat(
+                    points, img=img_inputs, img_metas=img_metas, **kwargs)
+            losses = dict()
+            if self.occ_head is not None:
+                voxel_semantics = kwargs['voxel_semantics']
+                mask_camera = kwargs['mask_camera']
+                occ_pred = self.occ_head(img_feats[0])
+                losses_occ = self.occ_head.loss(occ_pred, voxel_semantics,
+                                                mask_camera)
+                losses.update(losses_occ)
+            return losses
+
         img_feats, pts_feats, depth = self.extract_feat(
             points, img=img_inputs, img_metas=img_metas, **kwargs)
         if self.use_depth:
