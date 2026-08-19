@@ -70,6 +70,11 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
             det_results = [
                 dict(pts_bbox=result['pts_bbox']) for result in occ_results
             ]
+            # 纯 3D 检测模式（如 --cfg-options model.occ_head=None 加载纯检测
+            # 权重）：结果 dict 中无 'occ' 键，跳过占用评估，仅做检测评估
+            if 'occ' not in occ_results[0]:
+                return NuScenesDataset.evaluate(self, det_results,
+                                                **eval_kwargs)
             occ_results = [result['occ'] for result in occ_results]
 
         self.occ_eval_metrics = Metric_mIoU(
@@ -92,9 +97,22 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
                 gt_vis = self.vis_occ(gt_semantics)
                 pred_vis = self.vis_occ(occ_pred)
                 mmcv.imwrite(np.concatenate([gt_vis, pred_vis], axis=1),
-                             os.path.join(show_dir + "%d.jpg"%index))
+                             os.path.join(show_dir, "%d.jpg" % index))
 
         occ_metrics = self.occ_eval_metrics.count_miou()
+
+        # count_miou() 返回 (class_names, per_class_IoU, cnt) 元组，
+        # 需转换为 dict 才能与检测评估结果(dict)合并；键加 'occ/' 前缀避免冲突
+        class_names, per_class_ious, cnt = occ_metrics
+        occ_metrics = {
+            f'occ/mIoU/{name}': round(iou * 100, 2)
+            for name, iou in zip(class_names, per_class_ious)
+        }
+        # 与 count_miou() 内打印一致：mIoU 仅统计前 num_classes-1 类（不含 'free'）
+        occ_metrics['occ/mIoU'] = round(
+            np.nanmean(
+                per_class_ious[:self.occ_eval_metrics.num_classes - 1]) * 100,
+            2)
 
         if det_results is not None:
             det_metrics = NuScenesDataset.evaluate(self, det_results,

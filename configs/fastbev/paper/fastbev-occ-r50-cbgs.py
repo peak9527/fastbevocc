@@ -258,6 +258,7 @@ share_data_config = dict(
 
 test_data_config = dict(
     pipeline=test_pipeline,
+    data_root=data_root,
     ann_file=data_root + 'bevdetv3-nuscenes_infos_val.pkl')
 
 data = dict(
@@ -293,9 +294,6 @@ lr_config = dict(
     step=[20,])
 runner = dict(type='EpochBasedRunner', max_epochs=100)
 
-# 周期性评估（3D 检测 + occ mIoU）
-evaluation = dict(interval=5, pipeline=test_pipeline)
-
 custom_hooks = [
     dict(
         type='MEGVIIEMAHook',
@@ -308,6 +306,8 @@ custom_hooks = [
 
 # 不使用 fastbev-r50-cbgs.py 的 resume，防止占用头初始化错位。
 resume_from = None
+# resume_from = 'work_dirs/fastbev-occ-r50-cbgs/latest.pth'
+load_from = 'data/ckpts/init_merged.pth'
 # ---------------------------------------------------------------------------
 # 预训练权重加载（推荐方式：合并 FastBEV 检测 + FlashOCC occ 两个权重，
 # 让检测分支与 occ 分支都被初始化）：
@@ -315,7 +315,7 @@ resume_from = None
 #       --fastbev-ckpt work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth \
 #       --flashocc-ckpt data/ckpts/flashocc-r50-256x704.pth \
 #       --out work_dirs/fastbev-occ-r50-cbgs/init_merged.pth
-load_from = 'work_dirs/fastbev-occ-r50-cbgs/init_merged.pth'
+# load_from = 'work_dirs/fastbev-occ-r50-cbgs/init_merged.pth'
 # 合并权重包含 FastBEVOCC 的全部参数（检测分支 + occ_head），
 # 键一一对应，无需 strict=False，也无需额外参数。
 # ---------------------------------------------------------------------------

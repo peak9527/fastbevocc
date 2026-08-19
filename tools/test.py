@@ -1,7 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import os
+import sys
 import warnings
+from os import path as osp
+
+# Use the project-local mmdet3d (with FlashOCC support) first, so that
+# FlashOCC-related modules (NuScenesDatasetOccpancy, FastBEVOCC, ...) are
+# registered. Without this, the pip-installed mmdetection3d is loaded
+# and those modules are missing.
+PROJECT_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import mmcv
 import torch
@@ -262,6 +272,8 @@ def main():
             ]:
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
+            if args.show_dir is not None:
+                eval_kwargs['show_dir'] = args.show_dir
             print(dataset.evaluate(outputs, **eval_kwargs))
 
 

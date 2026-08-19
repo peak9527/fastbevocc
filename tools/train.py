@@ -3,9 +3,15 @@ from __future__ import division
 import argparse
 import copy
 import os
+import sys
 import time
 import warnings
 from os import path as osp
+
+# Use the project-local mmdet3d (with FlashOCC support) first.
+PROJECT_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import mmcv
 import torch
@@ -33,6 +39,13 @@ except ImportError:
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
+    parser.add_argument(
+        'gpu_num',
+        nargs='?',
+        type=int,
+        default=None,
+        help='(Convenience) number of gpus for non-distributed training. '
+        'Equivalent to --gpus. If omitted, defaults to --gpu-id 0.')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--resume-from', help='the checkpoint file to resume from')
@@ -101,6 +114,10 @@ def parse_args():
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
+
+    # Map convenience positional gpu_num -> --gpus (if --gpus not explicitly set)
+    if args.gpu_num is not None and args.gpus is None:
+        args.gpus = args.gpu_num
 
     if args.options and args.cfg_options:
         raise ValueError(

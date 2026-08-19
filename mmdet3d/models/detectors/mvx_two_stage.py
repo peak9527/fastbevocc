@@ -454,13 +454,22 @@ class MVXTwoStageDetector(Base3DDetector):
                                             self.pts_bbox_head.test_cfg)
         return merged_bboxes
 
-    def show_results(self, data, result, out_dir):
+    def show_results(self,
+                     data,
+                     result,
+                     out_dir,
+                     show=False,
+                     score_thr=0.1):
         """Results visualization.
 
         Args:
             data (dict): Input points and the information of the sample.
             result (dict): Prediction results.
             out_dir (str): Output directory of visualization result.
+            show (bool): Whether to display the result via Open3D. Not
+                implemented here; results are always saved to ``out_dir``.
+            score_thr (float): Score threshold of bounding boxes to keep.
+                Defaults to 0.1.
         """
         for batch_id in range(len(result)):
             if isinstance(data['points'][0], DC):
@@ -485,7 +494,7 @@ class MVXTwoStageDetector(Base3DDetector):
             file_name = osp.split(pts_filename)[-1].split('.')[0]
 
             assert out_dir is not None, 'Expect out_dir, got none.'
-            inds = result[batch_id]['pts_bbox']['scores_3d'] > 0.1
+            inds = result[batch_id]['pts_bbox']['scores_3d'] > score_thr
             pred_bboxes = result[batch_id]['pts_bbox']['boxes_3d'][inds]
 
             # for now we convert points and bbox into depth mode
