@@ -73,6 +73,7 @@ COLOR_MAP = np.array([
 
 FREE_ID = 17
 OCC_SIZE = 200
+OCC_Z = 16
 OCC_RANGE = 40.0  # occ 栅格覆盖 [-40, 40]m
 
 # 相机显示顺序（与 vis.py 完全一致）
@@ -147,21 +148,122 @@ def get_lidar2global(infos):
     return ego2global @ lidar2ego
 
 
-def occ_to_bev_rgb(occ):
+def occ_to_bev_rgb(occ, height_mode='none'):
     """occ (200,200,16) [y,-x,z] -> BEV 俯视 RGB 图 (200,200,3)。
     occ 标注维度排列为 (Y, -X, Z), 即 dim0=Y(左向), dim1=-X(后向), dim2=Z(高度)。
     dim1 的 X 轴方向与 lidar 相反（正向=后向而非前向）。
-    对每个 (y,x) 栅格取最低非 free 体素层（贴近地面），无有效体素显示为黑。
-    这样可与 lidar 地面点更好对齐，避免高层 terrain/manmade 遮挡地面结构。
+
+    height_mode:
+      - 'none':   对每个 (y,x) 取最低非 free 体素层（贴近地面），无有效体素显示为黑。
+                  这样可与 lidar 地面点更好对齐，避免高层 terrain/manmade 遮挡地面结构。
+      - 'height': 保持地面语义颜色，但按该列最高 occupied 体素高度调整亮度，
+                  z 越高越亮，从而在 BEV 俯视图中体现立体高度信息。
     """
     valid = (occ != FREE_ID).astype(np.int32)          # (200,200,16)
-    # np.argmax 返回第一个最大值位置，即最低非 free z
-    z_idx = np.argmax(valid, axis=2)                   # (200,200)
-    # 若整列全 free，argmax 返回 0；后续 mask 会过滤 free 区域
+    # 最低非 free 层（用于语义颜色）
+    z_bottom = np.argmax(valid, axis=2)                # (200,200)
+    # 最高非 free 层（用于高度编码）
+    z_top = (OCC_Z - 1) - np.argmax(valid[..., ::-1], axis=2)
+    no_occ = valid.sum(axis=2) == 0
+    z_top = np.where(no_occ, 0, z_top)
+
     sem_bev = occ[np.arange(OCC_SIZE)[:, None], np.arange(OCC_SIZE)[None, :],
-                  z_idx]                               # (200,200)
-    rgb = COLOR_MAP[sem_bev]                           # (200,200,3)
+                  z_bottom]                            # (200,200)
+    rgb = COLOR_MAP[sem_bev].astype(np.float32)        # (200,200,3)
+
+    if height_mode == 'height':
+        # z 越高越亮，factor 范围 [0.35, 1.0]
+        factor = 0.35 + 0.65 * (z_top.astype(np.float32) / (OCC_Z - 1))
+        rgb = rgb * factor[..., None]
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    else:
+        rgb = rgb.astype(np.uint8)
     return rgb
+
+
+def occ_to_extrusion(occ, canva_size, show_range, z_scale=1.2, cell_pad=0.9):
+    """把 occ (200,200,16) 渲染为 BEV 上的挤压柱画布 (N,N,3)，伪 3D 立体。
+
+    投影约定：保持 BEV 平面 (x,y) 不变，高度 z 沿画布向上（row 减小）延伸，
+    顶面向右上偏移形成菱形面（观察者位于 BEV 下方/近处）。
+    每个非空 (y,x) 栅格按最高 occupied 高度竖一根柱：
+      顶面 = 语义原色(最亮)，右侧面 = 语义色*0.55，上侧面(后侧) = 语义色*0.35。
+    绘制顺序：按柱顶深度分桶（远→近），桶内先上侧面 -> 右侧面 -> 顶面。
+    """
+    N = int(canva_size)
+    canvas = np.zeros((N, N, 3), dtype=np.uint8)
+    occ_h = int(canva_size * OCC_RANGE / show_range)
+    cell = occ_h / float(OCC_SIZE)
+    margin = int((canva_size - occ_h) / 2)
+    half = cell * cell_pad / 2.0
+
+    valid = (occ != FREE_ID).astype(np.int32)          # (200,200,16)
+    z_bottom = np.argmax(valid, axis=2)                # 最低非 free 层(语义)
+    z_top = (OCC_Z - 1) - np.argmax(valid[..., ::-1], axis=2)
+    no_occ = valid.sum(axis=2) == 0
+    ys, xs = np.nonzero(~no_occ)
+    if ys.size == 0:
+        return canvas
+    sem = occ[ys, xs, z_bottom[ys, xs]]                # (M,) 语义类别
+
+    # 格子中心在画布上的像素坐标（与 occ_rgb[::-1,::-1] 翻转一致）
+    rows = margin + (OCC_SIZE - 1 - ys) * cell + half
+    cols = margin + (OCC_SIZE - 1 - xs) * cell + half
+    hpx = (z_top[ys, xs].astype(np.float32) + 1) * cell * z_scale
+    ddx = hpx * 0.45                                   # 顶面右偏移
+    ddy = -hpx                                         # 顶面上偏移(row减小)
+
+    w = half
+    # 按柱顶深度分桶：深度 = 顶面上边缘 row（越小越远），远→近绘制
+    depth = rows - hpx - w
+    bucket_size = max(1.0, N / 32.0)
+    buckets = {}
+    for i in np.argsort(depth):
+        b = int(np.clip(depth[i] // bucket_size, 0, 31))
+        buckets.setdefault(b, []).append(i)
+
+    n_cls = COLOR_MAP.shape[0]
+    for b in sorted(buckets):
+        idx = np.array(buckets[b])
+        rr = rows[idx]
+        cc = cols[idx]
+        dx = ddx[idx]
+        dy = ddy[idx]
+        sub_sem = sem[idx]
+        for c in range(n_cls):
+            sel = np.nonzero(sub_sem == c)[0]
+            if sel.size == 0:
+                continue
+            r2 = rr[sel]
+            c2 = cc[sel]
+            x2 = dx[sel]
+            y2 = dy[sel]
+            # 上侧面(后侧, 最暗)
+            side_u = np.stack([
+                np.stack([c2 - w, r2 - w], axis=1),
+                np.stack([c2 + w, r2 - w], axis=1),
+                np.stack([c2 + w + x2, r2 - w + y2], axis=1),
+                np.stack([c2 - w + x2, r2 - w + y2], axis=1),
+            ], axis=1).astype(np.int32)
+            # 右侧面(中暗)
+            side_r = np.stack([
+                np.stack([c2 + w, r2 - w], axis=1),
+                np.stack([c2 + w, r2 + w], axis=1),
+                np.stack([c2 + w + x2, r2 + w + y2], axis=1),
+                np.stack([c2 + w + x2, r2 - w + y2], axis=1),
+            ], axis=1).astype(np.int32)
+            # 顶面(语义原色)
+            top = np.stack([
+                np.stack([c2 - w + x2, r2 - w + y2], axis=1),
+                np.stack([c2 + w + x2, r2 - w + y2], axis=1),
+                np.stack([c2 + w + x2, r2 + w + y2], axis=1),
+                np.stack([c2 - w + x2, r2 + w + y2], axis=1),
+            ], axis=1).astype(np.int32)
+            base = COLOR_MAP[c]
+            cv2.fillPoly(canvas, list(side_u), tuple(int(v * 0.35) for v in base))
+            cv2.fillPoly(canvas, list(side_r), tuple(int(v * 0.55) for v in base))
+            cv2.fillPoly(canvas, list(top), tuple(int(v) for v in base))
+    return canvas
 
 
 # ------------------------- 绘制 -------------------------
@@ -196,7 +298,8 @@ def draw_camera_images(infos, corners_lidar, pred_flag, views, scale_factor):
 
 def draw_bev_canvas(canva_size, show_range, occ=None, corners_lidar=None,
                     pred_flag=None, scores=None, vis_thred=0.3,
-                    lidar_path=None, draw_lidar=True):
+                    lidar_path=None, draw_lidar=True,
+                    occ_height_mode='none', occ_z_scale=1.2):
     """绘制 BEV 画布：occ 底图 + lidar 点 + 检测框。坐标系与 vis.py 完全一致。"""
     canvas = np.zeros((int(canva_size), int(canva_size), 3), dtype=np.uint8)
 
@@ -206,19 +309,24 @@ def draw_bev_canvas(canva_size, show_range, occ=None, corners_lidar=None,
     #    dim0=Y: 翻转使 y正(左)→row0(上)
     #    dim1=-X: 翻转使 x正(前,即dim1小值)→col大(右)
     if occ is not None:
-        occ_rgb = occ_to_bev_rgb(occ)
-        occ_h = int(canva_size * OCC_RANGE / show_range)
-        occ_bev = cv2.resize(
-            np.ascontiguousarray(occ_rgb[::-1, ::-1, :]),
-            (occ_h, occ_h),
-            interpolation=cv2.INTER_NEAREST)
-        margin = int((canva_size - occ_h) / 2)
-        roi = canvas[margin:margin + occ_h, margin:margin + occ_h, :]
-        # free 区域(深灰)改为透明，只保留有语义的区域
-        mask = (occ_bev.sum(axis=2) > 60 * 3).astype(np.uint8) * 255
-        mask = cv2.resize(mask, (occ_h, occ_h), interpolation=cv2.INTER_NEAREST)
-        occ_bev_masked = cv2.bitwise_and(occ_bev, occ_bev, mask=mask)
-        roi[:] = cv2.addWeighted(roi, 1.0, occ_bev_masked, 0.5, 0)
+        if occ_height_mode == 'column':
+            # 挤压柱伪 3D：每个非空格子按高度竖柱
+            canvas = occ_to_extrusion(occ, canva_size, show_range,
+                                      z_scale=occ_z_scale)
+        else:
+            occ_rgb = occ_to_bev_rgb(occ, height_mode=occ_height_mode)
+            occ_h = int(canva_size * OCC_RANGE / show_range)
+            occ_bev = cv2.resize(
+                np.ascontiguousarray(occ_rgb[::-1, ::-1, :]),
+                (occ_h, occ_h),
+                interpolation=cv2.INTER_NEAREST)
+            margin = int((canva_size - occ_h) / 2)
+            roi = canvas[margin:margin + occ_h, margin:margin + occ_h, :]
+            # free 区域(深灰)改为透明，只保留有语义的区域
+            mask = (occ_bev.sum(axis=2) > 60 * 3).astype(np.uint8) * 255
+            mask = cv2.resize(mask, (occ_h, occ_h), interpolation=cv2.INTER_NEAREST)
+            occ_bev_masked = cv2.bitwise_and(occ_bev, occ_bev, mask=mask)
+            roi[:] = cv2.addWeighted(roi, 1.0, occ_bev_masked, 0.5, 0)
 
         # 绿色 F 箭头：朝上 = 前向
         cx = int(canva_size / 2)
@@ -312,6 +420,13 @@ def parse_args():
     parser.add_argument('--vis-thred', type=float, default=0.1)
     parser.add_argument('--draw-gt', action='store_true',
                         help='Draw GT boxes (yellow)')
+    parser.add_argument('--occ-height-mode', type=str, default='none',
+                        choices=['none', 'height', 'column'],
+                        help="'none'=平面语义 BEV; "
+                             "'height'=按最高 occupied 高度调亮度，z 越高越亮; "
+                             "'column'=挤压柱伪3D立体")
+    parser.add_argument('--occ-z-scale', type=float, default=1.2,
+                        help="挤压柱高度缩放（column 模式），越大柱子越高")
     parser.add_argument('--no-lidar', action='store_true')
     parser.add_argument('--format', type=str, default='image',
                         choices=['image', 'video'])
@@ -431,7 +546,8 @@ def main():
             corners_lidar=corners_lidar, pred_flag=pred_flag,
             scores=scores, vis_thred=args.vis_thred,
             lidar_path=infos.get('lidar_path'),
-            draw_lidar=not args.no_lidar)
+            draw_lidar=not args.no_lidar,
+            occ_height_mode=args.occ_height_mode)
 
         # ---- fuse image-view and bev（与 vis.py 布局完全一致）----
         img = np.zeros((900 * 2 + canva_size * scale_factor, 1600 * 3, 3),

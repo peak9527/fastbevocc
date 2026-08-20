@@ -284,7 +284,7 @@ test_data_config = dict(
 
 data = dict(
     # 方案 B 显存占用更少，可尝试加大 batch size（如 6/8）
-    samples_per_gpu=4,
+    samples_per_gpu=16,
     workers_per_gpu=4,
     train=dict(
         type='CBGSDataset',
@@ -322,20 +322,15 @@ lr_config = dict(
     step=[20,])
 runner = dict(type='EpochBasedRunner', max_epochs=100)
 
-custom_hooks = [
-    dict(
-        type='MEGVIIEMAHook',
-        init_updates=10560,
-        priority='NORMAL',
-    ),
-]
 
-# fp16 = dict(loss_scale='dynamic')
+
+fp16 = dict(loss_scale='dynamic')
 
 # 加载 FastBEV 检测 + FlashOCC occ 合并权重：
 # 检测分支权重作为冻结初始值，occ_head 权重作为微调初始值。
-resume_from = None
-load_from = 'data/ckpts/init_merged.pth'
+# resume_from = None
+resume_from = 'work_dirs/fastbev-occ-r50-cbgs-freeze-det/latest.pth'
+# load_from = 'data/ckpts/init_merged.pth'
 # 若未生成合并权重，可退化为只加载 FastBEV 检测权重（occ_head 随机初始化）：
 #   load_from = 'work_dirs/fastbev-r50-cbgs/epoch_20_ema.pth'
 # 合并权重生成方式见 configs/fastbev/paper/fastbev-occ-r50-cbgs.py 末尾注释。
