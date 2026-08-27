@@ -41,6 +41,7 @@ class FastBEVOCCHead(BaseModule):
                  use_predicter=True,
                  class_balance=False,
                  loss_occ=None,
+                 aux_loss_occ=None,
                  bev_size=(128, 128),
                  occ_size=(200, 200),
                  bev_range=(-51.2, 51.2),
@@ -86,6 +87,17 @@ class FastBEVOCCHead(BaseModule):
                 type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0)
         self.loss_occ = build_loss(loss_occ)
 
+        # FlashOCC V2 风格的辅助损失（Lovász/sem_scal/geo_scal），配置开关：
+        #   aux_loss_occ=[dict(type='LovaszSoftmaxLoss', loss_weight=1.0),
+        #                 dict(type='SemScalLoss', loss_weight=1.0),
+        #                 dict(type='GeoScalLoss', loss_weight=1.0,
+        #                      non_empty_idx=0)]
+        # 传 None 或空列表即只保留主 loss_occ（CrossEntropyLoss）。
+        self.aux_loss_occ = []
+        if aux_loss_occ is not None:
+            for cfg in aux_loss_occ:
+                self.aux_loss_occ.append(build_loss(dict(cfg)))
+
         # 预计算 BEV -> occ 的重采样网格（buffer，不参与梯度）
         self.register_buffer(
             'bev2occ_grid',
@@ -99,6 +111,10 @@ class FastBEVOCCHead(BaseModule):
         occ 输出 (Dy', Dx')，每格覆盖 occ_range 范围。
         以格子中心对齐，将 occ 输出格的格心映射回 BEV 特征坐标。
         """
+        # BEV 与 occ 同分辨率同范围时无需重采样（返回 None，forward 跳过）
+        if (bev_size == occ_size) and (bev_range == occ_range):
+            return None
+
         by, bx = bev_size  # (H, W) = (Dy, Dx)
         oy, ox = occ_size
         bev_min, bev_max = bev_range
@@ -170,6 +186,8 @@ class FastBEVOCCHead(BaseModule):
                 preds, voxel_semantics, mask_camera,
                 avg_factor=num_total_samples)
             loss['loss_occ'] = loss_occ
+            loss.update(
+                self._calc_aux_losses(preds, voxel_semantics, mask_camera))
         else:
             voxel_semantics = voxel_semantics.reshape(-1)
             preds = occ_pred.reshape(-1, self.num_classes)
@@ -183,6 +201,26 @@ class FastBEVOCCHead(BaseModule):
             loss_occ = self.loss_occ(
                 preds, voxel_semantics, avg_factor=num_total_samples)
             loss['loss_occ'] = loss_occ
+            loss.update(self._calc_aux_losses(preds, voxel_semantics))
+        return loss
+
+    def _calc_aux_losses(self, preds, voxel_semantics, mask_camera=None):
+        """计算 FlashOCC V2 风格的辅助 occ 损失。
+
+        Args:
+            preds (torch.Tensor): (P, num_classes) logits。
+            voxel_semantics (torch.Tensor): (P,) long 标签。
+            mask_camera (torch.Tensor | None): (P,) 0/1 相机可见 mask。
+        """
+        loss = dict()
+        if not self.aux_loss_occ:
+            return loss
+        kwargs = dict()
+        if mask_camera is not None:
+            kwargs['weight'] = mask_camera
+        for loss_fn in self.aux_loss_occ:
+            loss[loss_fn.loss_name] = loss_fn(
+                preds, voxel_semantics, **kwargs)
         return loss
 
     def get_occ(self, occ_pred, img_metas=None):

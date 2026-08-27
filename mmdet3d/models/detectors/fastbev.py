@@ -1,5 +1,6 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.runner import force_fp32
 
@@ -570,15 +571,59 @@ class FastBEVOCC(FastBEV):
     训练时同时优化检测损失与占用损失；测试时同时输出 BEV 3D 目标检测结果
     （pts_bbox）和语义占用栅格（occ）。
 
+    分支解耦（det_downsample 非 None 时启用）：
+    - BEV 特征为 200x200@0.4m（与 occ 栅格分辨率一致），occ 头直接消费原生
+      0.4m 特征，不再做 0.8m->0.4m 插值上采样；
+    - 检测分支先经 det_downsample（stride-2 卷积）下采样到 100x100
+      （0.8m/像素），CenterHead 的 heatmap 尺寸与 target 编码保持兼容。
+
     Args:
         occ_head (dict | None): Configuration dict of the occupancy head.
+        det_downsample (dict | None): Configuration dict of the detection
+            branch downsample layer. If None, the detection head consumes the
+            original BEV feature directly. 支持可选的 'detach' 键
+            （detach=True 时检测特征 detach()，用于消融"检测/occ 任务竞争"）。
     """
 
-    def __init__(self, occ_head=None, init_cfg=None, **kwargs):
+    def __init__(self, occ_head=None, det_downsample=None, init_cfg=None,
+                 **kwargs):
         super(FastBEVOCC, self).__init__(init_cfg=init_cfg, **kwargs)
         self.occ_head = None
         if occ_head is not None:
             self.occ_head = builder.build_head(occ_head)
+        self.det_downsample = None
+        self.detach_det = False
+        if det_downsample is not None:
+            from mmcv.cnn import ConvModule
+            self.detach_det = det_downsample.get('detach', False)
+            self.det_downsample = nn.Sequential(
+                ConvModule(
+                    det_downsample['in_channels'],
+                    det_downsample['out_channels'],
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    bias=True))
+
+    def _det_feats(self, img_feats):
+        """检测分支特征：200x200@0.4m -> 100x100@0.8m（物理分辨率不变）。
+
+        若 det_downsample.detach=True，在 det_downsample 之前对共享 BEV 特征做
+        detach()，使检测 loss 的梯度不回流到 BEV 特征/视图变换网络——用于验证
+        "检测任务抢占 BEV 特征导致 occ 变差"的假设（此时检测分支照常训练，
+        仅共享特征不共享梯度）。
+
+        注意：detach 必须在 det_downsample 输入处切断，而不是在输出处——否则
+        det_downsample 自身参数收不到梯度，DDP(find_unused_parameters=False)
+        会报 "Expected to have finished reduction" 崩溃。
+        """
+        if self.detach_det:
+            img_feats = [f.detach() for f in img_feats]
+        if self.det_downsample is not None:
+            det_feats = [self.det_downsample(img_feats[0])]
+        else:
+            det_feats = img_feats
+        return det_feats
 
     def forward_train(self,
                       points=None,
@@ -605,9 +650,9 @@ class FastBEVOCC(FastBEV):
             losses = dict(loss_depth=loss_depth)
         else:
             losses = dict()
-        losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
-                                            gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore)
+        losses_pts = self.forward_pts_train(self._det_feats(img_feats),
+                                            gt_bboxes_3d, gt_labels_3d,
+                                            img_metas, gt_bboxes_ignore)
         losses.update(losses_pts)
         if self.occ_head is not None:
             voxel_semantics = kwargs['voxel_semantics']
@@ -633,7 +678,8 @@ class FastBEVOCC(FastBEV):
         img_feats, _, _ = self.extract_feat(
             points, img=img, img_metas=img_metas, **kwargs)
         bbox_list = [dict() for _ in range(len(img_metas))]
-        bbox_pts = self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        bbox_pts = self.simple_test_pts(self._det_feats(img_feats),
+                                        img_metas, rescale=rescale)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         if self.occ_head is not None:
@@ -651,7 +697,7 @@ class FastBEVOCC(FastBEV):
         img_feats, _, _ = self.extract_feat(
             points, img=img_inputs, img_metas=img_metas, **kwargs)
         assert self.with_pts_bbox
-        outs = self.pts_bbox_head(img_feats)
+        outs = self.pts_bbox_head(self._det_feats(img_feats))
         if self.occ_head is not None:
             occ_pred = self.occ_head(img_feats[0])
             return [outs, occ_pred]
