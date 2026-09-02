@@ -9,10 +9,20 @@ from mmcv.runner import BaseModule
 
 from ..builder import HEADS, build_loss
 
+# 自定义 yk_c1 数据集 33 类 occ 的真实类别频率（mask_camera 口径，与
+# class_balance 的 loss 一致：voxel_semantics[mask_camera]）。
+# 统计自 yk_c1_infos_train.pkl 的 labels.npz（5252 帧），
+# 工具：tools/compute_occ_class_freq.py（数据更新后可重跑替换）。
+#   索引 0=ignore、1~31=zhito 语义、32=free(空)；free 占比极高属正常。
+# 若换回 nuScenes FlashOCC 18 类模型，请改用原 18 类数组：
+#   [944004, 1897170, 152386, 2391677, 16957802, 724139, 189027, 2074468,
+#    413451, 2384460, 5916653, 175883646, 4275424, 51393615, 61411620,
+#    105975596, 116424404, 1892500630]
 nusc_class_frequencies = np.array([
-    944004, 1897170, 152386, 2391677, 16957802, 724139, 189027, 2074468,
-    413451, 2384460, 5916653, 175883646, 4275424, 51393615, 61411620,
-    105975596, 116424404, 1892500630
+    0, 47543, 110947, 839101, 0, 123345, 384490, 21127, 100961, 259928,
+    117530, 4549, 1220, 11147350, 8944604, 518708, 13084358, 773130, 547539,
+    6640438, 2791150, 18339, 3, 6895, 77829, 64341, 16944, 220878, 3888,
+    11485, 306, 0, 3238614714
 ])
 
 
@@ -76,8 +86,18 @@ class FastBEVOCCHead(BaseModule):
         self.num_classes = num_classes
         self.class_balance = class_balance
         if self.class_balance:
+            # nusc_class_frequencies 长度必须与 num_classes 一致（自定义数据
+            # 可能大于内置 18 类）；不足时用中位数填充避免索引越界。
+            # 训练集中完全缺失的类别（freq=0）会得到负权重（1/log(0.001)），
+            # 统一 clip 到 >=1：零频类权重极大但不影响数值（无样本贡献）。
+            freq = np.asarray(nusc_class_frequencies, dtype=np.float32)
+            if freq.shape[0] < num_classes:
+                pad = np.full(num_classes - freq.shape[0],
+                              float(np.median(freq)), dtype=np.float32)
+                freq = np.concatenate([freq, pad])
+            freq = np.maximum(freq, 1.0)
             class_weights = torch.from_numpy(
-                1 / np.log(nusc_class_frequencies[:num_classes] + 0.001))
+                1 / np.log(freq[:num_classes] + 0.001))
             self.cls_weights = class_weights
             if loss_occ is not None:
                 loss_occ['class_weight'] = class_weights

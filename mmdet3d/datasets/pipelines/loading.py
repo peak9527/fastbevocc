@@ -1179,10 +1179,22 @@ class LoadAnnotations(object):
 @PIPELINES.register_module()
 class BEVAug(object):
 
-    def __init__(self, bda_aug_conf, classes, is_train=True):
+    def __init__(self,
+                 bda_aug_conf,
+                 classes,
+                 is_train=True,
+                 point_cloud_range=None,
+                 occ_voxel_size=None):
         self.bda_aug_conf = bda_aug_conf
         self.is_train = is_train
         self.classes = classes
+        # occ GT 栅格参数（可选）。传入后，BEVAug 会把 bda 的旋转/缩放/平移
+        # 通过最近邻重采样同步作用于 voxel_semantics/mask_lidar/mask_camera，
+        # 使 FastBEVOCC 双任务模型的检测分支可以安全启用 BEV rot/scale 增强
+        # （此前只能做 flip，导致检测分支缺少旋转/尺度增强、航向回归变差）。
+        # 不传时保持旧行为（仅 flip），不影响其他配置。
+        self.point_cloud_range = point_cloud_range
+        self.occ_voxel_size = occ_voxel_size
 
     def sample_bda_augmentation(self):
         """Generate bda augmentation values based on bda_config."""
@@ -1262,12 +1274,62 @@ class BEVAug(object):
             results['img_inputs'] = (imgs, rots, trans, intrins, post_rots,
                                      post_trans, bda_mat)
         if 'voxel_semantics' in results:
-            if flip_dx:
-                results['voxel_semantics'] = results['voxel_semantics'][::-1,...].copy()
-                results['mask_lidar'] = results['mask_lidar'][::-1,...].copy()
-                results['mask_camera'] = results['mask_camera'][::-1,...].copy()
-            if flip_dy:
-                results['voxel_semantics'] = results['voxel_semantics'][:,::-1,...].copy()
-                results['mask_lidar'] = results['mask_lidar'][:,::-1,...].copy()
-                results['mask_camera'] = results['mask_camera'][:,::-1,...].copy()
+            if self.point_cloud_range is not None and \
+                    self.occ_voxel_size is not None:
+                self._aug_occ_by_bda(results, bda_rot, tran_bda)
+            else:
+                if flip_dx:
+                    results['voxel_semantics'] = \
+                        results['voxel_semantics'][::-1, ...].copy()
+                    results['mask_lidar'] = \
+                        results['mask_lidar'][::-1, ...].copy()
+                    results['mask_camera'] = \
+                        results['mask_camera'][::-1, ...].copy()
+                if flip_dy:
+                    results['voxel_semantics'] = \
+                        results['voxel_semantics'][:, ::-1, ...].copy()
+                    results['mask_lidar'] = \
+                        results['mask_lidar'][:, ::-1, ...].copy()
+                    results['mask_camera'] = \
+                        results['mask_camera'][:, ::-1, ...].copy()
         return results
+
+    def _aug_occ_by_bda(self, results, bda_rot, tran_bda):
+        """用 bda 矩阵（旋转+缩放+flip）最近邻重采样 occ GT 栅格。
+
+        与检测分支 gt_bboxes_3d 使用同一个 bda 变换（p_aug = R @ p_orig + t），
+        保证 BEV 特征、检测框、occ GT 三者坐标系完全一致。
+
+        voxel_semantics 布局 [x, y, z]（如 200x200x16@0.4m）：
+          - 第一维 = x（索引 0 -> x_min + 0.5*vx），第二维 = y；
+          - bda 只作用于 xy 平面（z 分量为 1），z 层保持不变；
+          - 重采样越界区域填 0（ignore，不参与 loss，与 mask=0 一致）。
+        """
+        pc_min_x, pc_min_y = self.point_cloud_range[:2]
+        vx, vy = self.occ_voxel_size
+        rot = bda_rot[:2, :2].numpy()
+        inv_rot = np.linalg.inv(rot)
+        t = np.asarray(tran_bda, dtype=np.float32).reshape(-1)[:2]
+
+        # 输出栅格中心（增强后世界坐标）
+        X, Y, _ = results['voxel_semantics'].shape
+        xs = pc_min_x + (np.arange(X) + 0.5) * vx
+        ys = pc_min_y + (np.arange(Y) + 0.5) * vy
+        XX, YY = np.meshgrid(xs, ys, indexing='ij')
+        # 逆变换：p_aug = R @ p_orig + t  ->  p_orig = R^-1 (p_aug - t)
+        dx, dy = XX - t[0], YY - t[1]
+        ox = (inv_rot[0, 0] * dx + inv_rot[0, 1] * dy - pc_min_x) / vx - 0.5
+        oy = (inv_rot[1, 0] * dx + inv_rot[1, 1] * dy - pc_min_y) / vy - 0.5
+        # round 后索引落在 [0, X-1] 当且仅当 ox 在 [-0.5, X-0.5)；
+        # 用该区间判 valid 可避免浮点误差（如 199.00000000000003）误判越界
+        ox_i = np.clip(np.round(ox).astype(np.int64), 0, X - 1)
+        oy_i = np.clip(np.round(oy).astype(np.int64), 0, Y - 1)
+        valid = (ox >= -0.5) & (ox <= X - 0.5) & (oy >= -0.5) & (oy <= Y - 0.5)
+
+        for key in ('voxel_semantics', 'mask_lidar', 'mask_camera'):
+            if key not in results:
+                continue
+            arr = results[key]
+            out = np.array(arr[ox_i, oy_i, :], copy=True)
+            out[~valid] = 0
+            results[key] = out

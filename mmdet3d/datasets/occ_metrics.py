@@ -55,11 +55,16 @@ class Metric_mIoU():
                  num_classes=18,
                  use_lidar_mask=False,
                  use_image_mask=False,
+                 class_names=None,
                  ):
-        self.class_names = ['others','barrier', 'bicycle', 'bus', 'car', 'construction_vehicle',
-                            'motorcycle', 'pedestrian', 'traffic_cone', 'trailer', 'truck',
-                            'driveable_surface', 'other_flat', 'sidewalk',
-                            'terrain', 'manmade', 'vegetation','free']
+        # 默认 nuScenes occ3d 18 类；自定义数据（yk_c1，zhito 标注规范 31 类）
+        # 由 NuScenesDatasetOccpancy 传入 class_names（长度 = num_classes）。
+        if class_names is None:
+            class_names = ['others','barrier', 'bicycle', 'bus', 'car', 'construction_vehicle',
+                           'motorcycle', 'pedestrian', 'traffic_cone', 'trailer', 'truck',
+                           'driveable_surface', 'other_flat', 'sidewalk',
+                           'terrain', 'manmade', 'vegetation','free']
+        self.class_names = list(class_names)
         self.save_dir = save_dir
         self.use_lidar_mask = use_lidar_mask
         self.use_image_mask = use_image_mask
