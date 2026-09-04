@@ -38,6 +38,7 @@ import argparse
 import json
 import os
 import pickle
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import cv2
@@ -45,10 +46,14 @@ import numpy as np
 from pyquaternion import Quaternion
 
 # 与 nuScenes occ3d / FastBEVOCCHead 对齐的 occ 栅格
-OCC_X = [-40.0, 40.0, 0.4]   # 200
-OCC_Y = [-40.0, 40.0, 0.4]   # 200
-OCC_Z = [-1.0, 5.4, 0.4]     # 16
-OCC_SHAPE = (200, 200, 16)   # (Dx, Dy, Dz) 与 labels.npz 一致
+# 当前生效：BEV/occ xy 各向同性 0.2m（400x400），z 压缩为 [-0.5, 2.7]m×16 层提速
+# （检测分支在模型内部降采样到 0.8m/100x100，occ 真值/预测均保持 0.2m 分辨率）。
+# 需与 configs/fastbev/paper/fastbev-occ-r50-cbgs-custom.py 的
+# grid_config x/y/z 及 occ_head Dz/bev_size/occ_size 保持一致
+OCC_X = [-40.0, 40.0, 0.2]   # 400
+OCC_Y = [-40.0, 40.0, 0.2]   # 400
+OCC_Z = [-0.5, 2.7, 0.2]     # 16
+OCC_SHAPE = (400, 400, 16)   # (Dx, Dy, Dz) 与 labels.npz 一致
 
 # 仿照 nuScenes occ3d（FlashOCC 18 类 = 0~16 语义 + 17=free）：
 # yk_c1 自定义体系 33 类 = 0 无标注/ignore(mask_camera 外) + 1~31 语义 + 32=free(空)。
@@ -263,22 +268,45 @@ def run(args):
 
     tasks = [(info, args.data_root, args.out_root, label_map, args.free_label,
               args.lidar_subdir, args.free_id) for info in infos]
+    total = len(tasks)
     n_ok = 0
+    n_done = 0
+    t0 = time.time()
+    last_pct = 0
+
+    def _report():
+        nonlocal last_pct
+        if total == 0:
+            return
+        pct = int(100.0 * n_done / total)
+        if pct >= last_pct + 5 or n_done == total:
+            el = time.time() - t0
+            rate = n_done / el if el > 0 else 0.0
+            eta = (total - n_done) / rate if rate > 0 else 0.0
+            print(f'[progress {time.strftime("%H:%M:%S")}] {n_done}/{total} '
+                  f'({100.0 * n_done / total:.1f}%), ok={n_ok}, '
+                  f'{rate:.1f} fps, eta {eta / 60:.1f} min', flush=True)
+            last_pct = pct
+
     if args.num_workers > 1:
         with ProcessPoolExecutor(args.num_workers) as ex:
             for tok, msg in ex.map(process_frame, tasks):
+                n_done += 1
                 if msg.startswith('OK'):
                     n_ok += 1
                 else:
                     print(f'  {msg}')
+                _report()
     else:
         for task in tasks:
             tok, msg = process_frame(task)
+            n_done += 1
             if msg.startswith('OK'):
                 n_ok += 1
             else:
                 print(f'  {msg}')
-    print(f'generated {n_ok}/{len(infos)} frames -> {args.out_root}')
+            _report()
+    print(f'generated {n_ok}/{total} frames -> {args.out_root}')
 
     # 写回 occ_path
     if args.write_back:

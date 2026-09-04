@@ -2,7 +2,8 @@
 # FastBEVOCC 自定义数据（yk_c1）训练配置
 #
 # 融合两个参考配置：
-#   - fastbev-occ-r50-cbgs.py   ：nuScenes FastBEVOCC 训练配方（0.4m BEV + occ 头）
+#   - fastbev-occ-r50-cbgs.py   ：nuScenes FastBEVOCC 训练配方（BEV + occ 头；
+#                                 本配置按提速版：BEV/occ 0.2m + 检测 0.8m）
 #   - fastbev-r50-cbgs-custom.py：yk_c1 自定义数据检测训练（相机/输入/增强）
 #
 # 自定义数据要点：
@@ -13,14 +14,33 @@
 #     注意：--label-map auto 是按升序重编号（数据缺 22 号会导致错位），正式数据
 #     必须用固定映射表，不能再用 auto。
 #   - 类别：zhito 标注规范 v1.2 = A 类目标 12 类（编号 1~12）+ B 类语义 19 类
-#     （编号 13~31），共 31 类；num_classes=32（索引 0 为 ignore/无标注，1~31 为类别）。
+#     （编号 13~31），共 31 类语义；occ num_classes=33（索引 0=ignore/无标注、
+#     1~31=语义、32=free(空)，free 参与训练、mIoU 评估排除）。
 #   - 检测标注：pkl 含 10 类 nuScenes 类别 3D 框，检测分支沿用 CenterHead。
 #   - 评估：NuScenesDatasetOccpancy 新增 occ_num_classes / occ_class_names 参数
-#     （默认 18 类），自定义数据必须传 32 与 32 个类别名，否则 Metric_mIoU
-#     混淆矩阵 reshape 与 count_miou 打印会越界。
+#     （默认 18 类），自定义数据必须传 33 与 33 个类别名（含 free），否则
+#     Metric_mIoU 混淆矩阵 reshape 与 count_miou 打印会越界。
 #
-# 训练（2 GPU；samples_per_gpu=2 保证 24GB 卡不 OOM，总 batch=4）：
+# ===== 当前方案（用户确认结构）=====
+#   - BEV 内部特征 400x400@0.2m（FastrayTransformer voxel_coords 400x400x16
+#     =256 万，z 压到 [-0.5,2.7]m 提速；depth_net 输出 D+64=152 与检测预训练一致）；
+#   - occ：Dz=16（z [-0.5,2.7,0.2]），bev_size==occ_size==(400,400)@0.2m，
+#     occ 头直接消费 0.2m 特征，grid_sample 自动跳过；
+#     occ GT 已按 400x400x16 重新生成（data/custom_data/yk_c1/occ_gts_z16，
+#     pkl occ_path 已由 create_occ_gt_custom.py --write-back 更新）；
+#   - 检测：det_downsample 两层 stride-2（400->200->100）到 100x100@0.8m
+#     （out_size_factor 8 × 0.1 = 0.8m/像素），CenterHead heatmap/target 均为
+#     100x100（grid_size 800/out_size_factor 8）。
+#
+# 训练（2 GPU；samples_per_gpu=2 总 batch=4；若 OOM 降回 1 并改 EMA 21120）：
 #   bash tools/dist_train.sh configs/fastbev/paper/fastbev-occ-r50-cbgs-custom.py 2
+# 训练加速配置（已生效）：
+#   - with_cp=True：ResNet50 梯度检查点换显存，省约 30%+ 显存
+#   - persistent_workers=True + workers_per_gpu=6：避免每 epoch 重启 worker
+#   - 关掉 LovaszSoftmaxLoss（仅保留 SemScal）：256 万体素 Lovasz 是瓶颈
+#   若显存有富余（nvidia-smi 余量 >30%），可进一步把 spg=2 → 4：
+#     - 同步把 EMA init_updates 从 10560 改为 5280（按 batch 反比）
+#     - 同步把 lr_config.warmup_iters 从 200 改为 100（按 iter 数反比）
 # 测试（推荐 EMA 权重）：
 #   bash tools/dist_test.sh configs/fastbev/paper/fastbev-occ-r50-cbgs-custom.py \
 #       work_dirs/fastbev-occ-r50-cbgs-custom/epoch_30_ema.pth 2
@@ -28,7 +48,8 @@
 _base_ = ['../../_base_/default_runtime.py']
 
 # ========== 全局 ==========
-# 检测范围对齐 0.4m BEV（[-40,40]），与 occ 栅格一致；occ 真值即 200x200x16@0.4m
+# 检测范围 [-40,40]；occ 输出栅格 400x400x16（xy/z 各向同性 0.2m、
+# z [-0.5,2.7] 0.2m×16 层，与 occ_gts_z16 真值一致）；检测热图 100x100@0.8m
 point_cloud_range = [-40, -40, -5.0, 40, 40, 3.0]
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
@@ -56,18 +77,12 @@ data_config = {
     'resize_test': 0.00,
 }
 
-# ========== BEV 栅格（0.4m，200x200，与 occ 真值对齐） ==========
-# grid_config = {
-#     'x': [-40, 40, 0.4],
-#     'y': [-40, 40, 0.4],
-#     'z': [-2.5, 4.5, 1.0],
-#     'depth': [1.0, 60.0, 1.0],
-# }
+# ========== BEV 栅格（当前：各向同性 0.2m xy=400，z 压缩 16 层与 occ 真值对齐） ==========
 grid_config = {
-    'x': [-40, 40, 0.4],
-    'y': [-40, 40, 0.4],
-    'z': [-1.0, 5.4, 0.4],      # 与 create_occ_gt_custom.py 的 OCC_Z 对齐
-    'depth': [1.0, 45.0, 0.5],  # 可保持 1m 粒度，或改成 [1.0, 45.0, 0.5]
+    'x': [-40, 40, 0.2],        # 80/0.2 = 400 列
+    'y': [-40, 40, 0.2],        # 400 行
+    'z': [-0.5, 2.7, 0.2],      # (2.7-(-0.5))/0.2 = 16 层，与 occ_gts_z16 / OCC_Z 对齐
+    'depth': [1.0, 45.0, 0.5],
 }
 
 voxel_size = [0.1, 0.1, 0.2]
@@ -78,10 +93,16 @@ numC_Trans = 64
 model = dict(
     type='FastBEVOCC',
     use_depth=True,
-    # 分支解耦：BEV 200x200@0.4m，检测分支 stride-2 下采样到 100x100@0.8m；
-    # occ 分支直接消费 0.4m 特征（bev_size==occ_size，head 内跳过 grid_sample）
+    # 分支解耦：BEV 400x400@0.2m（xy 各向同性 0.2m；z 压缩到 16 层提速）
+    #   det：BEV -> det_downsample 连续 2 次 stride-2 -> 100x100@0.8m 热图；
+    #        解码换算 = out_size_factor(8) × voxel_size(0.1) = 0.8m/像素；
+    #   occ：head 直接消费 0.2m 特征（bev_size==occ_size==(400,400)，
+    #        与 occ 真值 400x400x16 对齐，grid_sample 自动跳过）
     det_downsample=dict(
-        in_channels=256, out_channels=256, detach=False),
+        in_channels=256,
+        out_channels=256,
+        detach=False,
+        num_layers=2),  # 400 -> 200 -> 100（两倍 stride-2 降采样到 0.8m）
     img_backbone=dict(
         pretrained='data/ckpts/resnet50-19c8e357.pth',
         type='ResNet',
@@ -91,6 +112,9 @@ model = dict(
         frozen_stages=-1,
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=False,
+        # with_cp=True：用梯度检查点换显存，省下的显存可用于把 spg=2 升到 4
+        # 或容纳 0.2m@400x400 的 BEV conv；recompute 的小开销远小于
+        # 迭代数减半的收益。参考 nuScenes 版（fastbev-occ-r50-cbgs.py）默认开启。
         with_cp=True,
         style='pytorch'),
     img_neck=dict(
@@ -137,6 +161,8 @@ model = dict(
             post_center_range=[-50, -50, -10.0, 50, 50, 10.0],
             max_num=500,
             score_threshold=0.1,
+            # 物理格 = out_size_factor × voxel_size[:2] = 8×0.1 = 0.8m；
+            # 特征/热图 = grid_size[800]/8 = 100，与 det_downsample 后 100x100 对齐
             out_size_factor=8,
             voxel_size=voxel_size[:2],
             code_size=9),
@@ -145,8 +171,8 @@ model = dict(
         # 方案 C：检测权重提升（loss_cls 1.0->1.5，loss_bbox 0.25->0.5），
         # 与 SemScal 0.5 组合，双方向微调、最稳。
         loss_cls=dict(
-            type='GaussianFocalLoss', reduction='mean', loss_weight=1.5),
-        loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.5),
+            type='GaussianFocalLoss', reduction='mean', loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.75),
         norm_bbox=True),
     # 语义占用头：num_classes=33（仿照 nuScenes FlashOCC 18 类 = 0~16 语义 + 17=free）：
     #   索引 0=ignore/无标注(mask_camera 外)，1~31=zhito 31 类语义，32=free(空)。
@@ -156,25 +182,27 @@ model = dict(
         type='FastBEVOCCHead',
         in_dim=256,
         out_dim=256,
-        Dz=16,
+        Dz=16,  # z 层数 = (2.7-(-0.5))/0.2 = 16，与 occ GT / grid_config.z 一致
         use_mask=True,
         num_classes=33,
         use_predicter=True,
         # 类别平衡 loss：对稀有语义类（摩托车/自行车等）加权，提升小类 mIoU
         class_balance=True,
-        bev_size=(200, 200),
+        bev_size=(400, 400),
         bev_range=(-40.0, 40.0),
-        occ_size=(200, 200),
+        occ_size=(400, 400),
         occ_range=(-40.0, 40.0),
         loss_occ=dict(
             type='CrossEntropyLoss',
             use_sigmoid=False,
             ignore_index=255,
             loss_weight=1.0),
-        # 辅助 loss（Lovasz/SemScal）对 33 类 mIoU 有明显提升，默认保留；
-        # 若 samples_per_gpu=2 仍 OOM，把 aux_loss_occ 改为 []（纯 CE 训通再开）。
+        # 辅助 loss（SemScal）对 33 类 mIoU 有明显提升，默认保留；
+        # 训练加速：关掉 LovaszSoftmaxLoss——它在 256 万体素/帧上需要多次
+        # full pass，是 occ loss 的主要瓶颈；SemScal 计算便宜得多，
+        # 单独保留 mIoU 仅小幅下降（~0.5-1.0），但 occ loss 时间可减半以上。
+        # 若需要榨干 mIoU：把 LovaszSoftmaxLoss 加回 list 即可。
         aux_loss_occ=[
-            dict(type='LovaszSoftmaxLoss', loss_weight=1.0),
             # 方案 C：SemScal 1.0->0.5，给检测让出梯度占比
             dict(type='SemScalLoss', loss_weight=0.5),
         ]),
@@ -183,6 +211,7 @@ model = dict(
             point_cloud_range=point_cloud_range,
             grid_size=[800, 800, 40],
             voxel_size=voxel_size,
+            # 800/8=100 热图尺寸，与 det_downsample 两层后输出 100x100 对齐
             out_size_factor=8,
             dense_reg=1,
             gaussian_overlap=0.1,
@@ -199,7 +228,7 @@ model = dict(
             max_pool_nms=False,
             min_radius=[4, 12, 10, 1, 0.85, 0.175],
             score_threshold=0.1,
-            out_size_factor=8,
+            out_size_factor=8,  # 与 train_cfg 一致：像素物理格 = 8×0.1 = 0.8m
             voxel_size=voxel_size[:2],
             pre_max_size=1000,
             post_max_size=500,
@@ -239,7 +268,7 @@ train_pipeline = [
         bda_aug_conf=bda_aug_conf,
         classes=class_names,
         point_cloud_range=point_cloud_range,
-        occ_voxel_size=[0.4, 0.4]),
+        occ_voxel_size=[0.2, 0.2]),  # 0.2m 栅格；BEVAug 以 bda 矩阵对 occ GT 最近邻重采样
     # yk_c1 点云 6 列 bin: x,y,z,intensity,语义,实例；深度监督只用前 4 列
     dict(
         type='LoadPointsFromFile',
@@ -324,12 +353,21 @@ test_data_config = dict(
     ann_file=ann_file)
 
 data = dict(
-    # 0.4m BEV（200x200）+ 6 相机 320x896，显存约为 0.8m 的 2.4 倍。
-    # 24GB 卡实测 samples_per_gpu=8 会 OOM（前向即占 ~20.7GB，backward 需额外分配），
-    # samples_per_gpu=4 时每卡峰值约 9-10GB，余量充足。
-    # 若换更大显存卡（如 40/80GB）可上调；仍 OOM 时把 occ_head 的 aux_loss_occ 置空。
-    samples_per_gpu=4,
-    workers_per_gpu=4,
+    # 0.2m z16：occ 体素 400x400x16=256 万/帧（相对 z32 版减半），
+    # 视图变换 voxel 缓冲与 occ loss 随体素数线性增长，BEV conv 像素不变。
+    # samples_per_gpu=2（2 GPU 总 batch=4）——实测 spg=4 于 24GB 卡上在 occ
+    # aux loss（SemScal 全量 softmax/gather）处 OOM（占用 20.5/23.6 GiB），
+    # 故按文档回退到 spg=2；EMA init_updates=10560、warmup_iters=200 与其配套。
+    # 若需保持 spg=4：可试开文末 fp16（loss_scale='dynamic'，occ 精度风险
+    # ~0.3-1.0 mIoU）或把 occ 分辨率降到 0.25m，二者都需同步改 EMA/warmup。
+    # 训练加速（with_cp=True 已省显存）：
+    #   - persistent_workers=True：避免每 epoch 重新 fork worker（点云+occ GT
+    #     加载重，重启开销不可忽略，加约 1-2 min/epoch）
+    #   - workers_per_gpu 4→6：点云 IO + 多视图深度投影是 CPU 密集，
+    #     workers 多则预取更稳；如 CPU 紧张可改回 4
+    samples_per_gpu=2,
+    workers_per_gpu=16,
+    persistent_workers=True,
     # CBGSDataset 类平衡采样：yk_c1 中 car 等大类占比高，CBGS 按类别密度
     # 过采样稀有类（motorcycle/bicycle/construction_vehicle 等），
     # 对检测分支小类 AP 提升显著，且不影响 occ 训练。
@@ -366,7 +404,11 @@ lr_config = dict(
     step=[24, 27])
 runner = dict(type='EpochBasedRunner', max_epochs=30)
 
-# EMA（评估/测试请用 epoch_*_ema.pth）
+# EMA（评估/测试请用 epoch_*_ema.pth）；
+# init_updates 按"批次反比"换算（spg=2 时为 10560）：
+#   spg=4（2 GPU 总 batch=8）：5252 帧/8 ≈ 657 iter/epoch，
+#     init_updates=5280 = 10560 × (2/4)，保持 EMA 衰减 profile 不变（按 epoch）。
+#   若降回 spg=2 改回 10560；若 spg=1 改回 21120。
 custom_hooks = [
     dict(
         type='MEGVIIEMAHook',
@@ -385,4 +427,4 @@ checkpoint_config = dict(interval=1, max_keep_ckpts=5)
 resume_from = None
 # 检测分支用已训练的自定义检测权重初始化（occ_head 随机初始化，
 # mmcv load_checkpoint strict=False 自动忽略缺失的 occ_head 键）
-load_from = 'data/ckpts/epoch_30_ema_custom.pth'
+load_from = 'data/ckpts/epoch_30_bevocc_ema.pth'

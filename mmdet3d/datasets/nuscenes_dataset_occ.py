@@ -38,8 +38,9 @@ colors_map = np.array(
 class NuScenesDatasetOccpancy(NuScenesDataset):
     def __init__(self, *args, occ_num_classes=18, occ_class_names=None, **kwargs):
         # 兼容 nuscenes occ3d 默认 18 类；自定义数据（如 yk_c1，zhito 标注 31 类）
-        # 由配置文件传入 occ_num_classes=32 与 occ_class_names（长度=occ_num_classes），
-        # 供 evaluate() 中 Metric_mIoU 正确构建混淆矩阵与打印类别名。
+        # 由配置文件传入 occ_num_classes=33（31 语义 + 0 ignore + 32 free）与
+        # occ_class_names（长度=occ_num_classes），供 evaluate() 中 Metric_mIoU
+        # 正确构建混淆矩阵与打印类别名。
         super(NuScenesDatasetOccpancy, self).__init__(*args, **kwargs)
         self.occ_num_classes = occ_num_classes
         self.occ_class_names = occ_class_names
@@ -158,10 +159,14 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
 
     def vis_occ(self, semantics):
         # simple visualization of result in BEV
-        semantics_valid = np.logical_not(semantics == 17)
-        d = np.arange(16).reshape(1, 1, 16)
-        d = np.repeat(d, 200, axis=0)
-        d = np.repeat(d, 200, axis=1).astype(np.float32)
+        # 栅格尺寸由数组形状自适应（当前 0.2m: 400x400x16）；
+        # free(最后一类=空) 不参与"取顶"。
+        free_id = self.occ_num_classes - 1
+        semantics_valid = np.logical_not(semantics == free_id)
+        D0, D1, Dz = semantics.shape
+        d = np.arange(Dz).reshape(1, 1, Dz)
+        d = np.repeat(d, D0, axis=0)
+        d = np.repeat(d, D1, axis=1).astype(np.float32)
         d = d * semantics_valid
         selected = np.argmax(d, axis=2)
 
@@ -176,6 +181,6 @@ class NuScenesDatasetOccpancy(NuScenesDataset):
         # 自定义数据类别数可能 > colors_map 行数（18），越界索引防落到黑/透明
         occ_bev[occ_bev >= len(colors_map)] = 0
         occ_bev_vis = colors_map[occ_bev].astype(np.uint8)
-        occ_bev_vis = occ_bev_vis.reshape(200, 200, 4)[::-1, ::-1, :3]
-        occ_bev_vis = cv2.resize(occ_bev_vis,(400,400))
+        occ_bev_vis = occ_bev_vis.reshape(D0, D1, 4)[::-1, ::-1, :3]
+        occ_bev_vis = cv2.resize(occ_bev_vis, (400, 400))
         return occ_bev_vis

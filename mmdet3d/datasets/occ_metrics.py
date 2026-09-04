@@ -70,9 +70,11 @@ class Metric_mIoU():
         self.use_image_mask = use_image_mask
         self.num_classes = num_classes
 
-        self.point_cloud_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
-        self.occupancy_size = [0.4, 0.4, 0.4]
-        self.voxel_size = 0.4
+        self.point_cloud_range = [-40.0, -40.0, -0.5, 40.0, 40.0, 2.7]
+        # 当前：pred/gt 均为各向同性 0.2m 栅格（400x400x16，z∈[-0.5,2.7]）。
+        # 此处仅记录统计信息；mIoU 实际按数组与 mask 直接统计，不依赖分辨率。
+        self.occupancy_size = [0.2, 0.2, 0.2]
+        self.voxel_size = 0.2
         self.occ_xdim = int((self.point_cloud_range[3] - self.point_cloud_range[0]) / self.occupancy_size[0])
         self.occ_ydim = int((self.point_cloud_range[4] - self.point_cloud_range[1]) / self.occupancy_size[1])
         self.occ_zdim = int((self.point_cloud_range[5] - self.point_cloud_range[2]) / self.occupancy_size[2])
@@ -153,14 +155,17 @@ class Metric_mIoU():
 
 
 class Metric_FScore():
+    # 注：当前评估流程（NuScenesDatasetOccpancy.evaluate）只实例化 Metric_mIoU，
+    # FScore 未被启用。默认参数已按 yk_c1 33 类 / 0.2m z16 栅格同步，
+    # 启用前请核对 range/void 与栅格几何一致。
     def __init__(self,
 
                  leaf_size=10,
                  threshold_acc=0.6,
                  threshold_complete=0.6,
-                 voxel_size=[0.4, 0.4, 0.4],
-                 range=[-40, -40, -1, 40, 40, 5.4],
-                 void=[17, 255],
+                 voxel_size=[0.2, 0.2, 0.2],
+                 range=[-40, -40, -0.5, 40, 40, 2.7],
+                 void=[0, 32, 255],  # 0=ignore/未标注、32=free(空)、255=add_batch mask 外
                  use_lidar_mask=False,
                  use_image_mask=False, ) -> None:
 

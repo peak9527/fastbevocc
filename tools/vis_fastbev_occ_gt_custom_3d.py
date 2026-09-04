@@ -145,9 +145,11 @@ EMPTY_ID = 0  # ignore：不可观测体素，与 free 一样不渲染
 def _occ_empty(occ):
     """0=ignore(不可观测) 与 32=free(空) 均视为空体素（不显示/不生成网格）。"""
     return (occ == EMPTY_ID) | (occ == FREE_ID)
-OCC_SIZE = 200
+OCC_SIZE = 400
 OCC_Z = 16
 OCC_RANGE = 40.0  # occ 栅格覆盖 [-40, 40]m
+# z 起点偏移：与 create_occ_gt_custom.py 的 OCC_Z=[-0.5, 2.7, 0.2] 一致
+OCC_Z_OFFSET = -0.5
 
 # 相机显示顺序（与 vis.py 完全一致）
 CAM_ORDER = [
@@ -211,7 +213,7 @@ def lidar2img(points_lidar, camrera_info):
 
 
 def occ_centers_lidar(infos):
-    """occ 体素中心在激光(lidar)系的坐标 (200,200,16,3)。
+    """occ 体素中心在激光(lidar)系的坐标 (400,400,16,3)。
 
     create_occ_gt_custom.py 生成 occ 时先把点云从 lidar 系转到 ego 系
     （lidar2ego）再体素化，因此 labels.npz 的体素坐标在 ego 系；
@@ -220,21 +222,21 @@ def occ_centers_lidar(infos):
     体素中心 (gx=X, gy=Y, gz=Z) 的 ego 系坐标（与 OCC_SHAPE=(Dx,Dy,Dz) 对齐）：
         x_ego = (gx + 0.5) * res - OCC_RANGE
         y_ego = (gy + 0.5) * res - OCC_RANGE
-        z_ego = (gz + 0.5) * res - 1.0
+        z_ego = (gz + 0.5) * res + OCC_Z_OFFSET
     lidar2ego: p_ego = R @ p_lidar + t  →  p_lidar = R.T @ (p_ego - t) = (p_ego - t) @ R
     """
     res = 2 * OCC_RANGE / OCC_SIZE
     g = (np.arange(OCC_SIZE) + 0.5) * res - OCC_RANGE
-    zc = (np.arange(OCC_Z) + 0.5) * res - 1.0
+    zc = (np.arange(OCC_Z) + 0.5) * res + OCC_Z_OFFSET
     gxx, gyy, gzz = np.meshgrid(g, g, zc, indexing='ij')
-    ego = np.stack([gxx, gyy, gzz], axis=-1)           # (200,200,16,3)
+    ego = np.stack([gxx, gyy, gzz], axis=-1)           # (400,400,16,3)
     rot = Quaternion(infos['lidar2ego_rotation']).rotation_matrix
     t = np.array(infos['lidar2ego_translation'], dtype=np.float32)
     return (ego - t) @ rot
 
 
 def occ_to_bev_rgb(occ, height_mode='none'):
-    """occ (200,200,16) [X,Y,Z] -> BEV 俯视 RGB 图 (200,200,3)。
+    """occ (400,400,16) [X,Y,Z] -> BEV 俯视 RGB 图 (400,400,3)。
     occ 维度排列与 create_occ_gt_custom.py 的 OCC_SHAPE=(Dx,Dy,Dz) 一致：
     dim0=X(前向), dim1=Y(左向), dim2=Z(高度)，即 occ[gx, gy, gz]。
 
@@ -246,17 +248,17 @@ def occ_to_bev_rgb(occ, height_mode='none'):
       - 'height': 保持地面语义颜色，但按该列最高 occupied 体素高度调整亮度，
                   z 越高越亮，从而在 BEV 俯视图中体现立体高度信息。
     """
-    valid = (~_occ_empty(occ)).astype(np.int32)          # (200,200,16)
+    valid = (~_occ_empty(occ)).astype(np.int32)          # (400,400,16)
     # 最低非空层（用于语义颜色）
-    z_bottom = np.argmax(valid, axis=2)                # (200,200)
+    z_bottom = np.argmax(valid, axis=2)                # (400,400)
     # 最高非空层（用于高度编码）
     z_top = (OCC_Z - 1) - np.argmax(valid[..., ::-1], axis=2)
     no_occ = valid.sum(axis=2) == 0
     z_top = np.where(no_occ, 0, z_top)
 
     sem_bev = occ[np.arange(OCC_SIZE)[:, None], np.arange(OCC_SIZE)[None, :],
-                  z_bottom]                            # (200,200)
-    rgb = COLOR_MAP[sem_bev].astype(np.float32)        # (200,200,3)
+                  z_bottom]                            # (400,400)
+    rgb = COLOR_MAP[sem_bev].astype(np.float32)        # (400,400,3)
 
     if height_mode == 'height':
         # z 越高越亮，factor 范围 [0.35, 1.0]
@@ -270,7 +272,7 @@ def occ_to_bev_rgb(occ, height_mode='none'):
 
 def occ_to_extrusion(occ, canva_size, show_range, centers_lidar=None,
                      z_scale=1.2, cell_pad=0.9):
-    """把 occ (200,200,16) 渲染为 BEV 上的挤压柱画布 (N,N,3)，伪 3D 立体。
+    """把 occ (400,400,16) 渲染为 BEV 上的挤压柱画布 (N,N,3)，伪 3D 立体。
 
     occ 维度排列 dim0=X(前向)、dim1=Y(左向)，与 create_occ_gt_custom.py 一致；
     坐标以激光(lidar)系显示（传 centers_lidar，内部已做 ego→lidar 逆变换）。
@@ -289,7 +291,7 @@ def occ_to_extrusion(occ, canva_size, show_range, centers_lidar=None,
     margin = int((canva_size - occ_h) / 2)
     half = cell * cell_pad / 2.0
 
-    valid = (~_occ_empty(occ)).astype(np.int32)          # (200,200,16)
+    valid = (~_occ_empty(occ)).astype(np.int32)          # (400,400,16)
     z_bottom = np.argmax(valid, axis=2)                # 最低非空层(语义)
     z_top = (OCC_Z - 1) - np.argmax(valid[..., ::-1], axis=2)
     no_occ = valid.sum(axis=2) == 0
@@ -367,7 +369,7 @@ def occ_to_extrusion(occ, canva_size, show_range, centers_lidar=None,
 
 def occ_to_isometric(occ, canva_size, show_range, centers_lidar=None,
                      z_scale=1.2, cell_pad=0.9):
-    """把 occ (200,200,16) 渲染为等距斜视画布 (N,N,3)，伪 3D 立体。
+    """把 occ (400,400,16) 渲染为等距斜视画布 (N,N,3)，伪 3D 立体。
 
     occ 维度排列 dim0=X(前向)、dim1=Y(左向)，与 create_occ_gt_custom.py 一致；
     坐标以激光(lidar)系显示（传 centers_lidar，内部已做 ego→lidar 逆变换）。
@@ -393,7 +395,7 @@ def occ_to_isometric(occ, canva_size, show_range, centers_lidar=None,
     half = cell * cell_pad / 2.0
     pad = 0.02 * N
 
-    valid = (~_occ_empty(occ)).astype(np.int32)          # (200,200,16)
+    valid = (~_occ_empty(occ)).astype(np.int32)          # (400,400,16)
     z_bottom = np.argmax(valid, axis=2)                # 最低非空层(语义)
     z_top = (OCC_Z - 1) - np.argmax(valid[..., ::-1], axis=2)
     no_occ = valid.sum(axis=2) == 0
@@ -518,17 +520,17 @@ def _depth_to_colors(depths):
 
 
 def occ_to_3d_meshes(occ, voxel_size=0.38, centers_lidar=None):
-    """把 occ (200,200,16) [X,Y,Z] 转换为语义着色的立方体网格列表。
+    """把 occ (400,400,16) [X,Y,Z] 转换为语义着色的立方体网格列表。
 
     occ 维度排列 dim0=X(前向)、dim1=Y(左向)、dim2=Z，与 create_occ_gt_custom.py
     的 OCC_SHAPE=(Dx,Dy,Dz) 一致；世界坐标采用 FLU lidar 系（x 前、y 左、z 上），
     与 2D BEV 画布、lidar 点云、GT 框同系。传 centers_lidar 时直接使用其
     体素中心（已做 ego→lidar 逆变换，正确处理 lidar 安装高度等偏移）。
 
-    z 映射按 occ3d-nuscenes 官方 z∈[-1,5.4]m：层 k 中心 = k*res + res/2 - 1.0：
+    z 映射按当前 0.2m / z∈[-0.5,2.7]m / Dz=16：层 k 中心 = k*res + res/2 + OCC_Z_OFFSET：
         x = gx*res + res/2 - OCC_RANGE   (gx: dim0=X 索引)
         y = gy*res + res/2 - OCC_RANGE   (gy: dim1=Y 索引)
-        z = gz*res + res/2 - 1.0          (gz: dim2=Z 索引)
+        z = gz*res + res/2 + OCC_Z_OFFSET (gz: dim2=Z 索引)
     自定义 31 类体系：0=无标注/忽略(FREE_ID)不生成网格。
     每个非空体素生成一个立方体，按语义类别分组为独立 TriangleMesh
     （每类 paint_uniform_color），便于渲染与 ply 导出。
@@ -546,7 +548,7 @@ def occ_to_3d_meshes(occ, voxel_size=0.38, centers_lidar=None):
         centers = np.stack([
             gx * res + res / 2 - OCC_RANGE,
             gy * res + res / 2 - OCC_RANGE,
-            gz * res + res / 2 - 1.0,
+            gz * res + res / 2 + OCC_Z_OFFSET,
         ], axis=1).astype(np.float64)
     sem = occ[nz].astype(np.int32)
 
@@ -932,8 +934,8 @@ def parse_args():
                         help='相机注视点（x,y,z）')
     parser.add_argument('--occ-3d-zoom', type=float, default=4.0,
                         help='相机缩放（越大越近，默认 4.0）')
-    parser.add_argument('--occ-3d-voxel-size', type=float, default=0.4,
-                        help='体素显示边长（米），默认 0.4 满格')
+    parser.add_argument('--occ-3d-voxel-size', type=float, default=0.2,
+                        help='体素显示边长（米），默认 0.2 满格（与 0.2m occ GT 一致）')
     parser.add_argument('--occ-3d-lidar', action='store_true',
                         help='在 3D 场景中叠加 lidar 点云（按高度着色）')
     parser.add_argument('--occ-3d-boxes', action='store_true',
@@ -1015,7 +1017,7 @@ def main():
             occ_path = infos.get('occ_path')
             if occ_path and os.path.exists(os.path.join(occ_path, 'labels.npz')):
                 occ_gt = np.load(os.path.join(occ_path, 'labels.npz'))
-                occ = occ_gt['semantics']  # (200, 200, 16) [X, Y, Z]
+                occ = occ_gt['semantics']  # (400, 400, 16) [X, Y, Z]
                 centers_lidar = occ_centers_lidar(infos)
 
         # ---- 排序（低分框先画，高分框后画覆盖）----

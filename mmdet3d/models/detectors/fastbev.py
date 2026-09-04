@@ -571,11 +571,13 @@ class FastBEVOCC(FastBEV):
     训练时同时优化检测损失与占用损失；测试时同时输出 BEV 3D 目标检测结果
     （pts_bbox）和语义占用栅格（occ）。
 
-    分支解耦（det_downsample 非 None 时启用）：
-    - BEV 特征为 200x200@0.4m（与 occ 栅格分辨率一致），occ 头直接消费原生
-      0.4m 特征，不再做 0.8m->0.4m 插值上采样；
-    - 检测分支先经 det_downsample（stride-2 卷积）下采样到 100x100
-      （0.8m/像素），CenterHead 的 heatmap 尺寸与 target 编码保持兼容。
+    分支解耦（当前：BEV 0.2m 栅格 + 检测降采样，occ 头直接消费 0.2m 特征）：
+    - BEV 特征为 400x400@0.2m，occ 头直接消费原生 0.2m 特征
+      （bev_size==occ_size==(400,400)，grid_sample 自动跳过）；
+    - 检测分支经 det_downsample（num_layers 次 stride-2 卷积）下采样到
+      100x100@0.8m（num_layers=2: 400->200->100），CenterHead 的 heatmap
+      （100x100）与 target 编码（grid_size 800/out_size_factor 8=100）对齐；
+      解码物理格 = out_size_factor(8) × voxel_size(0.1) = 0.8m。
 
     Args:
         occ_head (dict | None): Configuration dict of the occupancy head.
@@ -596,17 +598,26 @@ class FastBEVOCC(FastBEV):
         if det_downsample is not None:
             from mmcv.cnn import ConvModule
             self.detach_det = det_downsample.get('detach', False)
-            self.det_downsample = nn.Sequential(
-                ConvModule(
-                    det_downsample['in_channels'],
-                    det_downsample['out_channels'],
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    bias=True))
+            # 连续 num_layers 次 stride-2 下采样（默认 1 层，向后兼容）：
+            #   400x400@0.2m -> 200x200@0.4m -> 100x100@0.8m（num_layers=2）
+            num_layers = det_downsample.get('num_layers', 1)
+            in_ch = det_downsample['in_channels']
+            out_ch = det_downsample['out_channels']
+            layers = []
+            for i in range(num_layers):
+                layers.append(
+                    ConvModule(
+                        in_ch,
+                        out_ch,
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                        bias=True))
+                in_ch = out_ch
+            self.det_downsample = nn.Sequential(*layers)
 
     def _det_feats(self, img_feats):
-        """检测分支特征：200x200@0.4m -> 100x100@0.8m（物理分辨率不变）。
+        """检测分支特征：400x400@0.2m -> 100x100@0.8m（num_layers 次 stride-2）。
 
         若 det_downsample.detach=True，在 det_downsample 之前对共享 BEV 特征做
         detach()，使检测 loss 的梯度不回流到 BEV 特征/视图变换网络——用于验证

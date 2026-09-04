@@ -47,19 +47,28 @@ def lovasz_softmax_flat(probas, labels):
     Args:
         probas (torch.Tensor): (P, C) softmax probabilities.
         labels (torch.Tensor): (P,) ground truth labels.
+
+    0.2m 体素下 P 可达数百万（400x400x16=256 万/帧），每类的 sort 都会产生
+    (P,) 级中间张量，峰值叠加明显。为控制显存：
+      1) 用 torch.unique 一次找出真实出现的类别，跳过缺失类的全量扫描；
+      2) 每类算完立即释放临时张量（fg/errors/perm），只保留标量 loss。
     """
     if probas.numel() == 0:
         return probas.sum() * 0.
     C = probas.size(1)
     losses = []
-    for c in range(C):
-        fg = (labels == c).float()
-        if fg.sum() == 0:  # classes='present'
+    present = torch.unique(labels).tolist()  # classes='present'
+    for c in present:
+        if c < 0 or c >= C:  # 防御：越界/ignore 标签
+            continue
+        fg = (labels == c)
+        if fg.sum() == 0:
             continue
         class_pred = probas[:, c]
-        errors = (fg - class_pred).abs()
+        errors = (fg.float() - class_pred).abs()
         errors_sorted, perm = torch.sort(errors, 0, descending=True)
-        fg_sorted = fg[perm]
+        fg_sorted = fg[perm].float()
+        del fg, class_pred, errors, perm  # 及时释放，降低单类峰值
         losses.append(torch.dot(errors_sorted, lovasz_grad(fg_sorted)))
     if not losses:
         return probas.sum() * 0.
