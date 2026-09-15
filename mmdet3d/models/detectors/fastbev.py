@@ -583,9 +583,28 @@ class FastBEVOCC(FastBEV):
             branch downsample layer. If None, the detection head consumes the
             original BEV feature directly. 支持可选的 'detach' 键
             （detach=True 时检测特征 detach()，用于消融"检测/occ 任务竞争"）。
+        pts_voxel_layer (dict | None): 点云体素化层配置（PointPillars 风格）。
+        pts_voxel_encoder (dict | None): 点云体素特征编码器配置。
+        pts_middle_encoder (dict | None): 点云中间编码器配置（scatter 成伪图像）。
+        pts_bev_encoder_backbone (dict | None): 激光 BEV backbone（可选，
+            若为 None 则直接用 scatter 输出与图像 BEV 融合）。
+        pts_bev_encoder_neck (dict | None): 激光 BEV neck（可选）。
+        fusion (dict | None): BEV 融合方式配置。支持：
+            - type='concat': 通道维拼接后用 1x1 conv 降维到 out_channels。
+            - type='add': 逐元素相加（需两分支通道数相同）。
+            若为 None，则不启用激光分支，行为与纯视觉 FastBEVOCC 一致。
     """
 
-    def __init__(self, occ_head=None, det_downsample=None, init_cfg=None,
+    def __init__(self,
+                 occ_head=None,
+                 det_downsample=None,
+                 pts_voxel_layer=None,
+                 pts_voxel_encoder=None,
+                 pts_middle_encoder=None,
+                 pts_bev_encoder_backbone=None,
+                 pts_bev_encoder_neck=None,
+                 fusion=None,
+                 init_cfg=None,
                  **kwargs):
         super(FastBEVOCC, self).__init__(init_cfg=init_cfg, **kwargs)
         self.occ_head = None
@@ -604,6 +623,118 @@ class FastBEVOCC(FastBEV):
                     stride=2,
                     padding=1,
                     bias=True))
+
+        # ---------- 激光雷达分支（多模态融合） ----------
+        self.with_lidar = fusion is not None
+        self.pts_voxel_layer = None
+        self.pts_voxel_encoder = None
+        self.pts_middle_encoder = None
+        self.pts_bev_encoder_backbone = None
+        self.pts_bev_encoder_neck = None
+        self.fusion = None
+
+        if self.with_lidar:
+            assert pts_voxel_layer is not None, \
+                "启用 fusion 时必须提供 pts_voxel_layer"
+            assert pts_voxel_encoder is not None, \
+                "启用 fusion 时必须提供 pts_voxel_encoder"
+            assert pts_middle_encoder is not None, \
+                "启用 fusion 时必须提供 pts_middle_encoder"
+            from mmdet3d.models.builder import build_voxel_encoder
+            from mmdet3d.ops import Voxelization
+            self.pts_voxel_layer = Voxelization(**pts_voxel_layer)
+            self.pts_voxel_encoder = build_voxel_encoder(pts_voxel_encoder)
+            self.pts_middle_encoder = builder.build_middle_encoder(
+                pts_middle_encoder)
+            if pts_bev_encoder_backbone is not None:
+                self.pts_bev_encoder_backbone = builder.build_backbone(
+                    pts_bev_encoder_backbone)
+            if pts_bev_encoder_neck is not None:
+                self.pts_bev_encoder_neck = builder.build_neck(
+                    pts_bev_encoder_neck)
+            # 融合模块
+            fusion_type = fusion.get('type', 'concat')
+            if fusion_type == 'concat':
+                self.fusion = nn.Conv2d(
+                    fusion['in_channels'],
+                    fusion['out_channels'],
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False)
+            elif fusion_type == 'add':
+                self.fusion = nn.Identity()
+            else:
+                raise ValueError(f"Unsupported fusion type: {fusion_type}")
+            self.fusion_type = fusion_type
+
+    @torch.no_grad()
+    @force_fp32()
+    def voxelize(self, points):
+        """对点云做体素化（与 CenterPoint.voxelize 一致）。
+
+        Args:
+            points (list[torch.Tensor]): 每帧点云，形状 (N_i, C)。
+
+        Returns:
+            voxels (torch.Tensor): (M, max_points, C)
+            num_points (torch.Tensor): (M,) 每个体素内实际点数
+            coors (torch.Tensor): (M, 4) [batch_idx, z, y, x]
+        """
+        voxels, coors, num_points = [], [], []
+        for res in points:
+            res_voxels, res_coors, res_num_points = self.pts_voxel_layer(res)
+            voxels.append(res_voxels)
+            coors.append(res_coors)
+            num_points.append(res_num_points)
+        voxels = torch.cat(voxels, dim=0)
+        num_points = torch.cat(num_points, dim=0)
+        coors_batch = []
+        for i, coor in enumerate(coors):
+            coor_pad = F.pad(coor, (1, 0), mode='constant', value=i)
+            coors_batch.append(coor_pad)
+        coors_batch = torch.cat(coors_batch, dim=0)
+        return voxels, num_points, coors_batch
+
+    def extract_pts_feat(self, points):
+        """提取激光 BEV 特征。
+
+        Args:
+            points (list[torch.Tensor]): 每帧点云。
+
+        Returns:
+            torch.Tensor: BEV 特征 [B, C, H, W]
+        """
+        voxels, num_points, coors = self.voxelize(points)
+        voxel_features = self.pts_voxel_encoder(voxels, num_points, coors)
+        batch_size = coors[-1, 0].item() + 1
+        x = self.pts_middle_encoder(voxel_features, coors, batch_size)
+        if self.pts_bev_encoder_backbone is not None:
+            x = self.pts_bev_encoder_backbone(x)
+        if self.pts_bev_encoder_neck is not None:
+            x = self.pts_bev_encoder_neck(x)
+            if isinstance(x, (list, tuple)):
+                x = x[0]
+        return x
+
+    def fuse_bev_feats(self, img_bev, pts_bev):
+        """BEV 特征融合。
+
+        Args:
+            img_bev (torch.Tensor): 图像 BEV 特征 [B, C_img, H, W]
+            pts_bev (torch.Tensor): 激光 BEV 特征 [B, C_pts, H, W]
+
+        Returns:
+            torch.Tensor: 融合后 BEV 特征 [B, C_out, H, W]
+        """
+        if self.fusion_type == 'concat':
+            x = torch.cat([img_bev, pts_bev], dim=1)
+            x = self.fusion(x)
+        elif self.fusion_type == 'add':
+            x = img_bev + pts_bev
+        else:
+            raise ValueError(f"Unsupported fusion type: {self.fusion_type}")
+        return x
 
     def _det_feats(self, img_feats):
         """检测分支特征：200x200@0.4m -> 100x100@0.8m（物理分辨率不变）。
@@ -642,7 +773,7 @@ class FastBEVOCC(FastBEV):
             dict: Losses of detection branch, depth branch (if use_depth)
                 and occupancy branch (if occ_head is not None).
         """
-        img_feats, pts_feats, depth = self.extract_feat(
+        img_feats, _, depth = self.extract_feat(
             points, img=img_inputs, img_metas=img_metas, **kwargs)
         if self.use_depth:
             gt_depth = kwargs['gt_depth']
@@ -650,14 +781,23 @@ class FastBEVOCC(FastBEV):
             losses = dict(loss_depth=loss_depth)
         else:
             losses = dict()
-        losses_pts = self.forward_pts_train(self._det_feats(img_feats),
+
+        # 多模态融合：图像 BEV + 激光 BEV
+        if self.with_lidar:
+            pts_bev = self.extract_pts_feat(points)
+            fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+            bev_feats = [fused_bev]
+        else:
+            bev_feats = img_feats
+
+        losses_pts = self.forward_pts_train(self._det_feats(bev_feats),
                                             gt_bboxes_3d, gt_labels_3d,
                                             img_metas, gt_bboxes_ignore)
         losses.update(losses_pts)
         if self.occ_head is not None:
             voxel_semantics = kwargs['voxel_semantics']
             mask_camera = kwargs['mask_camera']
-            occ_pred = self.occ_head(img_feats[0])
+            occ_pred = self.occ_head(bev_feats[0])
             losses_occ = self.occ_head.loss(occ_pred, voxel_semantics,
                                             mask_camera)
             losses.update(losses_occ)
@@ -677,13 +817,22 @@ class FastBEVOCC(FastBEV):
         """
         img_feats, _, _ = self.extract_feat(
             points, img=img, img_metas=img_metas, **kwargs)
+
+        # 多模态融合：图像 BEV + 激光 BEV
+        if self.with_lidar:
+            pts_bev = self.extract_pts_feat(points)
+            fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+            bev_feats = [fused_bev]
+        else:
+            bev_feats = img_feats
+
         bbox_list = [dict() for _ in range(len(img_metas))]
-        bbox_pts = self.simple_test_pts(self._det_feats(img_feats),
+        bbox_pts = self.simple_test_pts(self._det_feats(bev_feats),
                                         img_metas, rescale=rescale)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         if self.occ_head is not None:
-            occ_pred = self.occ_head(img_feats[0])
+            occ_pred = self.occ_head(bev_feats[0])
             occ_res = self.occ_head.get_occ(occ_pred)
             for result_dict, occ in zip(bbox_list, occ_res):
                 result_dict['occ'] = occ
@@ -696,10 +845,17 @@ class FastBEVOCC(FastBEV):
                       **kwargs):
         img_feats, _, _ = self.extract_feat(
             points, img=img_inputs, img_metas=img_metas, **kwargs)
+        # 多模态融合
+        if self.with_lidar:
+            pts_bev = self.extract_pts_feat(points)
+            fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+            bev_feats = [fused_bev]
+        else:
+            bev_feats = img_feats
         assert self.with_pts_bbox
-        outs = self.pts_bbox_head(self._det_feats(img_feats))
+        outs = self.pts_bbox_head(self._det_feats(bev_feats))
         if self.occ_head is not None:
-            occ_pred = self.occ_head(img_feats[0])
+            occ_pred = self.occ_head(bev_feats[0])
             return [outs, occ_pred]
         return outs
 
