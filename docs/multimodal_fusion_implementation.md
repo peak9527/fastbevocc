@@ -475,5 +475,219 @@ bash tools/dist_test.sh configs/fastbev/paper/fastbev-occ-r50-cbgs-fusion.py \
 
 ---
 
+## 10. v3 版本：多层级门控融合 + 增强体素特征（2026-09-16）
+
+v1（`fastbev-occ-r50-cbgs-fusion.py`）仅做「BEV 末端 concat 融合」，激光信息进入太晚。
+v3（`fastbev-occ-r50-cbgs-fusion-v3.py`）针对该问题做了 4 项改造。
+
+### 10.1 四项优化
+
+| # | 优化 | 配置位置 | 说明 |
+|---|------|---------|------|
+| 1 | 增强体素特征 | `pts_voxel_encoder` | `PillarFeatureNet` 新增 `with_height_stat`(+4: z_max/z_min/z_mean/z_std)、`with_density`(+1)、`with_intensity_stat`(+2)，共 +7 维；两层 MLP 输出 128ch |
+| 2 | 多层级融合 | `multi_level_fusion=True` | 在 BEV backbone 的每个 stage 输出后即做门控融合，再送入 FPN neck；激光信息更早参与特征提取 |
+| 3 | OCC 专用激光头 | `pts_occ_head` + `occ_fusion_weight` | 从激光 BEV 特征直接预测 OCC，与主 OCC 通过可学习权重 `alpha=sigmoid(occ_fuse_logit)` 融合；训练时双路监督（激光路 0.5 权重） |
+| 4 | 深度引导增强 | `img_view_transformer.loss_depth_weight` | 0.125 → 0.25（实测 1.0 会过度扰动预训练主干、拖慢检测/OCC 收敛） |
+
+### 10.2 新增代码接口
+
+```python
+# mmdet3d/models/detectors/fastbev.py
+
+# FastBEV：支持返回多尺度特征
+def bev_encoder(self, x, return_multi_level=False)
+def extract_img_feat(self, img, img_metas, return_multi_level=False, **kwargs)
+def multi_level_fuse(self, img_multi, pts_multi)   # 逐 stage 门控融合
+
+# FastBEVOCC：激光分支
+def extract_pts_feat(self, points, return_multi_level=False)  # 新增多尺度返回
+def fuse_bev_feats(self, img_bev, pts_bev)         # 支持 concat / add / gated
+```
+
+门控融合公式（逐 level / 末端各一次）：
+
+```
+gate = Sigmoid(Conv3x3(ReLU(BN(Conv3x3([F_img, F_pts])))))   # → 2 通道
+F_fused = gate[:, 0:1] * F_img + gate[:, 1:2] * F_pts
+```
+
+OCC 双路融合（可学习权重）：
+
+```python
+alpha = torch.sigmoid(self.occ_fuse_logit)          # 初始 0.7（主 OCC 占 70%）
+occ_pred = alpha * occ_pred_main + (1 - alpha) * occ_pred_lidar
+losses_occ = self.occ_head.loss(occ_pred, ...)      # 梯度回流到 occ_fuse_logit
+losses['pts_loss_occ'] = 0.5 * pts_occ_head.loss(occ_pred_lidar, ...)
+```
+
+### 10.3 关键实现细节
+
+- **只对 neck 消费的层级建融合模块**：`FPN_LSS` 默认 `input_feature_index=(0, 2)`，
+  未被消费的层级若也建融合单元，其参数永远拿不到梯度，DDP（`find_unused_parameters=False`）
+  会报 `Expected to have finished reduction` 崩溃。实现中从**已构建的 neck 实例**读取
+  `input_feature_index`（而非配置 dict，其有类默认值会误判），只对 `fusion_level_ids` 建融合，
+  其余层级原样透传。
+- **`backbone_output_ids=[0,1,2]`**：激光 BEV backbone（`CustomResNet`，`num_layer=[2,2,2]`，
+  `num_channels=[128,256,512]`）输出全部 3 层以配合多层级融合；`with_cp=False` 规避
+  DDP + 多路径消费的兼容性问题。
+- **新分支 5x 学习率**：`paramwise_cfg` 给 `pts_*`、`img_proj`、`pts_proj`、`gate_net`、
+  `level_fusions`、`occ_fuse_logit` 设 `lr_mult=5.0`（1e-4 → 5e-4），因其为随机初始化，
+  而视觉主干与 `occ_head` 来自基线 `epoch_24_ema.pth` 预训练权重。
+
+### 10.4 训练配置
+
+| 项目 | 值 |
+|------|-----|
+| 配置文件 | `configs/fastbev/paper/fastbev-occ-r50-cbgs-fusion-v3.py` |
+| 输出目录 | `work_dirs/fastbev-occ-r50-cbgs-fusion-v3/` |
+| 预训练权重 | `work_dirs/fastbev-occ-r50-cbgs-custom/epoch_24_ema.pth`（`load_from`） |
+| batch / 优化器 | 2 GPU × `samples_per_gpu=4`（总 batch 8）、AdamW lr 1e-4、warmup 300 iter、step [18, 21]、24 epoch |
+| 显存 | 每卡约 19.6 GB / 24 GB |
+
+启动命令：
+
+```bash
+cd /home/server/workspace/nvidia/fastbev_py
+source /home/server/miniconda3/etc/profile.d/conda.sh && conda activate bev
+nohup bash tools/dist_train.sh configs/fastbev/paper/fastbev-occ-r50-cbgs-fusion-v3.py 2 \
+    > work_dirs/fastbev-occ-r50-cbgs-fusion-v3/train_nohup_r2.log 2>&1 &
+```
+
+### 10.5 训练状态
+
+| 时间 | 事件 |
+|------|------|
+| 2026-09-16 13:53–16:11 | 多轮调试重启（`samples_per_gpu`、GPU 数调整） |
+| 2026-09-16 16:12–17:04 | 训练至 epoch1/iter1050 被中断（无 checkpoint） |
+| 2026-09-16 17:07 | **重新启动训练（本次）**，双卡 100% 利用率、显存约 19.6 GB/卡，epoch1 损失正常收敛 |
+
+首个 epoch 损失（本次运行）：
+
+| Iter | loss_depth | task0.loss_heatmap | pts_loss_occ | loss_occ | loss |
+|------|-----------|-------------------|--------------|----------|------|
+| 50 | 18.10 | 5.71 | 1.55 | 3.34 | 39.65 |
+| 100 | 7.12 | 3.77 | 0.21 | 0.83 | 21.47 |
+
+**观察**：深度损失与 OCC 损失均快速下降；`pts_loss_occ` 收敛到同一量级，说明激光分支
+OCC 监督生效。预计 24 epoch 约需 2 天，checkpoint 按 epoch 保存在输出目录。
+
+> 待办：训练完成后运行检测（mAP/NDS）与 OCC（mIoU）评估，与纯视觉基线
+> `fastbev-occ-r50-cbgs-custom` 及 v1 融合结果对比，并把最终指标补入本文档。
+
+---
+
+## 11. v3.1 修正与增强（2026-09-16，重新启动训练）
+
+v3 首轮训练过程中发现一个实质性缺陷，并在此基础上补齐了激光数据增强与双向融合。
+
+### 11.1 【Bug 修复】点云未参与 bda 增强（最高优先级）
+
+**现象**：`train_pipeline` 顺序是 `BEVAug → LoadPointsFromFile`，而 `BEVAug`
+内的点云增强分支写作 `if 'points' in results:` —— 执行 BEVAug 时点云尚未加载，
+该分支永远不执行。
+
+**后果**：图像 BEV 处于 bda 坐标系（旋转 ±22.5°、缩放 0.95~1.05、50% 翻转），
+激光 BEV 停留在原始 lidar 坐标系，**两个分支空间错位**，融合时激光信息落到
+错误的空间位置。
+
+**修复**（对齐官方多模态参考实现 `configs/dal/dal-base.py`）：
+
+```
+修复前： PrepareImageInputs → LoadAnnotations → LoadOccGTFromFile
+        → BEVAug → LoadPointsFromFile → PointToMultiViewDepth → ...
+
+修复后： PrepareImageInputs → LoadAnnotations → LoadOccGTFromFile
+        → LoadPointsFromFile            # 点云先加载
+        → BEVAug                        # bda 同步作用到点云
+        → PointToMultiViewDepthFusion   # 深度图（内部先做 bda 逆变换）
+        → RandomPointDrop → RandomIntensityJitter → PointShuffle
+        → ObjectRangeFilter → ...
+```
+
+两处必须成对修改：点云已被 bda 增强后，深度图必须改用
+`PointToMultiViewDepthFusion`（内部 `p_orig = R^-1 (p_aug - t)` 还原回原始
+lidar 坐标系再投影），否则深度监督同样错位。
+
+**验证**：用手工 bda 变换 `p @ R.T + t` 与 pipeline 输出点云逐点比对，
+最大误差 `0.000000`。
+
+### 11.2 新增激光数据增强
+
+新增两个 transform（`mmdet3d/datasets/pipelines/transforms_3d.py`）：
+
+| Transform | 作用 | 配置 |
+|-----------|------|------|
+| `RandomPointDrop` | 逐点伯努利采样丢点，模拟点云稀疏/遮挡；带 `min_points` 下限保护 | `drop_ratio=0.15, min_points=1000` |
+| `RandomIntensityJitter` | 加性高斯噪声 + 乘性缩放 + 整帧置零（模拟强度缺失）；保证非负、不改 xyz、不就地修改 | `jitter_std=2.0, clip_range=6.0, scale_range=(0.9,1.1), zero_ratio=0.02` |
+
+参数依据实测 intensity 分布（中位数 7 / 均值 15.3 / 99 分位 81）确定：噪声取
+绝对刻度且偏小，避免淹没暗点信号。另启用 `PointShuffle` 打乱点序，避免体素内
+`max_num_points=32` 截断偏向采集顺序靠前的点。
+
+实测：原始 122038 点 → 增强后 103764 点（丢点率 0.150，与配置一致）。
+
+### 11.3 方案 A：双向融合（图像语义反哺激光分支）
+
+**动机**：v3 的融合是单向的 —— 激光特征流入图像分支（`multi_level_fuse` 与末端
+`fuse_bev_feats`），而激光自己的 `pts_occ_head` 消费的是**纯激光**特征
+`pts_bev_final`，从未获得图像语义。激光有几何但缺语义、图像有语义但缺几何。
+
+**实现**：在激光 neck 输出后增加一组与正向结构对称的门控，用融合特征（已含
+图像语义）调制激光 BEV 特征，再送入 `pts_occ_head`：
+
+```python
+# fastbev.py
+def rev_fuse_bev_feats(self, pts_bev, fused_bev):
+    pts_feat = self.rev_pts_proj(pts_bev)
+    img_feat = self.rev_img_proj(fused_bev)
+    gate = self.rev_gate_net(torch.cat([pts_feat, img_feat], dim=1))
+    return gate[:, 0:1] * pts_feat + gate[:, 1:2] * img_feat
+```
+
+```python
+# forward_train / simple_test
+pts_bev_for_occ = self.rev_fuse_bev_feats(pts_bev_for_occ, bev_feats[0])
+pts_occ_pred = self.pts_occ_head(pts_bev_for_occ)
+```
+
+配置（`hidden_channels=64`，为正向 gate 的一半以控制算力）：
+
+```python
+reverse_fusion=dict(
+    type='gated',
+    in_channels_pts=256, in_channels_img=256,
+    out_channels=256, hidden_channels=64),
+```
+
+**算力代价**（实测）：
+
+| 指标 | 增量 |
+|------|------|
+| 参数量 | ≈ 0.15 M（`rev_pts_proj` + `rev_img_proj` + `rev_gate_net`，共 7 个张量） |
+| 理论 FLOPs | ≈ 6 GMACs/样本 |
+| 显存 | torch 统计 19509 → 20403 MB（约 +0.9 GB，含激光增强侧开销） |
+| 迭代耗时 | ≈ 2.96 → 3.03 s/iter（约 +2%） |
+
+结论：方案 A 的算力开销很小，适合先落地验证收益。
+
+### 11.4 当前训练状态
+
+| 时间 | 事件 |
+|------|------|
+| 17:07–17:37 | v3 首轮（旧配置：点云未对齐、无激光增强、单向融合），至 iter 400+ 主动停止 |
+| 17:37 | 应用上述三项改动并重启训练（PID 1454269） |
+
+首 100 iter 损失（r3，含全部改动）：
+
+| Iter | loss_depth | loss_heatmap | pts_loss_occ | loss_occ | loss |
+|------|-----------|--------------|--------------|----------|------|
+| 50 | 18.80 | 4.85 | 1.59 | 3.36 | 39.45 |
+| 100 | 7.21 | 2.95 | 0.22 | 0.82 | 20.40 |
+
+> 注意：本次重启同时引入了三类变化（对齐修复 / 激光增强 / 双向融合）。
+> 若要单独归因某一项的收益，需各自单独训练一次做消融。
+
+---
+
 *文档生成时间: 2026-09-15*
-*最后更新时间: 2026-09-15*
+*最后更新时间: 2026-09-16*

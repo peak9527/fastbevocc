@@ -43,6 +43,9 @@ class PillarFeatureNet(nn.Module):
                  with_distance=False,
                  with_cluster_center=True,
                  with_voxel_center=True,
+                 with_height_stat=False,
+                 with_density=False,
+                 with_intensity_stat=False,
                  voxel_size=(0.2, 0.2, 4),
                  point_cloud_range=(0, -40, -3, 70.4, 40, 1),
                  norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
@@ -57,9 +60,21 @@ class PillarFeatureNet(nn.Module):
             in_channels += 3
         if with_distance:
             in_channels += 1
+        # 增强体素特征：高度统计（z_max, z_min, z_mean, z_std）
+        if with_height_stat:
+            in_channels += 4
+        # 增强体素特征：密度（点数 / max_points，归一化）
+        if with_density:
+            in_channels += 1
+        # 增强体素特征：强度统计（i_mean, i_std）
+        if with_intensity_stat:
+            in_channels += 2
         self._with_distance = with_distance
         self._with_cluster_center = with_cluster_center
         self._with_voxel_center = with_voxel_center
+        self._with_height_stat = with_height_stat
+        self._with_density = with_density
+        self._with_intensity_stat = with_intensity_stat
         self.fp16_enabled = False
         # Create PillarFeatureNet layers
         self.in_channels = in_channels
@@ -152,6 +167,49 @@ class PillarFeatureNet(nn.Module):
         mask = get_paddings_indicator(num_points, voxel_count, axis=0)
         mask = torch.unsqueeze(mask, -1).type_as(features)
         features *= mask
+
+        # ---- 增强体素特征：高度统计 / 密度 / 强度统计 ----
+        # 这些是 pillar 级别的全局统计量，广播到每个点上
+        extra_feats = []
+        N, M, _ = features.shape
+        num_pts = num_points.type_as(features).view(N, 1, 1).clamp(min=1.0)
+
+        if self._with_height_stat:
+            # z 坐标在 features 的第 2 维（索引 2）
+            z_feat = features[:, :, 2:3]  # (N, M, 1)
+            z_masked = z_feat * mask
+            z_max = z_masked.max(dim=1, keepdim=True)[0]  # (N, 1, 1)
+            z_min = z_masked.masked_fill(~mask.bool(), 1e9).min(
+                dim=1, keepdim=True)[0]
+            z_min = z_min.masked_fill(z_min > 1e8, 0.0)  # 空 pillar 设为 0
+            z_mean = z_masked.sum(dim=1, keepdim=True) / num_pts
+            z_var = ((z_masked - z_mean) ** 2 * mask).sum(
+                dim=1, keepdim=True) / num_pts
+            z_std = z_var.clamp(min=0).sqrt()
+            height_stat = torch.cat([z_max, z_min, z_mean, z_std], dim=-1)
+            height_stat = height_stat.expand(-1, M, -1) * mask
+            extra_feats.append(height_stat)
+
+        if self._with_density:
+            # 归一化密度：实际点数 / pillar 最大点数
+            density = num_pts / float(M)  # (N, 1, 1)
+            density = density.expand(-1, M, 1) * mask
+            extra_feats.append(density)
+
+        if self._with_intensity_stat:
+            # 强度在 features 的第 3 维（索引 3）
+            i_feat = features[:, :, 3:4]  # (N, M, 1)
+            i_masked = i_feat * mask
+            i_mean = i_masked.sum(dim=1, keepdim=True) / num_pts
+            i_var = ((i_masked - i_mean) ** 2 * mask).sum(
+                dim=1, keepdim=True) / num_pts
+            i_std = i_var.clamp(min=0).sqrt()
+            intensity_stat = torch.cat([i_mean, i_std], dim=-1)
+            intensity_stat = intensity_stat.expand(-1, M, -1) * mask
+            extra_feats.append(intensity_stat)
+
+        if extra_feats:
+            features = torch.cat([features] + extra_feats, dim=-1)
 
         for pfn in self.pfn_layers:
             features = pfn(features, num_points)

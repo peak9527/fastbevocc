@@ -16,14 +16,18 @@
 #     （编号 13~31），共 31 类；num_classes=32（索引 0 为 ignore/无标注，1~31 为类别）。
 #   - 检测标注：pkl 含 10 类 nuScenes 类别 3D 框，检测分支沿用 CenterHead。
 #   - 评估：NuScenesDatasetOccpancy 新增 occ_num_classes / occ_class_names 参数
-#     （默认 18 类），自定义数据必须传 32 与 32 个类别名，否则 Metric_mIoU
-#     混淆矩阵 reshape 与 count_miou 打印会越界。
+#     （默认 18 类），自定义数据必须传 33 与 33 个类别名（0=ignore、1~31 语义、32=free），
+#     否则 Metric_mIoU 混淆矩阵 reshape 与 count_miou 打印会越界。
 #
-# 训练（2 GPU；samples_per_gpu=2 保证 24GB 卡不 OOM，总 batch=4）：
+# 训练（2 GPU；samples_per_gpu=4，总 batch=8，每卡约 10GB）：
 #   bash tools/dist_train.sh configs/fastbev/paper/fastbev-occ-r50-cbgs-custom.py 2
 # 测试（推荐 EMA 权重）：
 #   bash tools/dist_test.sh configs/fastbev/paper/fastbev-occ-r50-cbgs-custom.py \
-#       work_dirs/fastbev-occ-r50-cbgs-custom/epoch_30_ema.pth 2
+#       work_dirs/fastbev-occ-r50-cbgs-custom/epoch_24_ema.pth 2
+#
+# 24e 快速验证：训练配置与 fastbev-occ-r50-cbgs-fusion-v3.py 完全对齐
+# （同 batch=8、同 lr=1e-4、同 warmup=300、同衰减点 [18,21]、同 EMA 起点），
+# 使「是否引入激光融合」成为两者唯一变量，便于公平对比检测与 OCC 指标。
 
 _base_ = ['../../_base_/default_runtime.py']
 
@@ -355,22 +359,22 @@ for key in ['val', 'test']:
 data['train']['dataset'].update(share_data_config)
 data['train']['dataset']['data_root'] = data_root
 
-# ========== 优化器（30e 快速验证，epoch 24/27 两次衰减，各 0.1x） ==========
+# ========== 优化器（24e 快速验证，epoch 18/21 两次衰减，各 0.1x） ==========
 optimizer = dict(type='AdamW', lr=1e-4, weight_decay=1e-2)
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',
     warmup='linear',
-    warmup_iters=200,
+    warmup_iters=300,
     warmup_ratio=0.001,
-    step=[24, 27])
-runner = dict(type='EpochBasedRunner', max_epochs=30)
+    step=[18, 21])
+runner = dict(type='EpochBasedRunner', max_epochs=24)
 
 # EMA（评估/测试请用 epoch_*_ema.pth）
 custom_hooks = [
     dict(
         type='MEGVIIEMAHook',
-        init_updates=10560,
+        init_updates=5280,
         priority='NORMAL',
     ),
 ]

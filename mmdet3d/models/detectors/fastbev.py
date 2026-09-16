@@ -63,9 +63,24 @@ class FastBEV(CenterPoint):
         return x, stereo_feat
 
     @force_fp32()
-    def bev_encoder(self, x):
-        x = self.img_bev_encoder_backbone(x)
-        x = self.img_bev_encoder_neck(x)
+    def bev_encoder(self, x, return_multi_level=False):
+        """BEV 编码器。
+
+        Args:
+            x (torch.Tensor): 输入 BEV 特征 [B, C, H, W]
+            return_multi_level (bool): 是否返回 backbone 多尺度特征
+
+        Returns:
+            torch.Tensor | tuple: 最终特征 或 (multi_feats, final_feat)
+        """
+        multi_feats = self.img_bev_encoder_backbone(x)
+        if return_multi_level and isinstance(multi_feats, (list, tuple)):
+            neck_input = list(multi_feats)
+            x = self.img_bev_encoder_neck(neck_input)
+            if type(x) in [list, tuple]:
+                x = x[0]
+            return list(multi_feats), x
+        x = self.img_bev_encoder_neck(multi_feats)
         if type(x) in [list, tuple]:
             x = x[0]
         return x
@@ -90,19 +105,57 @@ class FastBEV(CenterPoint):
         return [imgs, sensor2keyegos, ego2globals, intrins,
                 post_rots, post_trans, bda]
 
-    def extract_img_feat(self, img, img_metas, **kwargs):
+    def extract_img_feat(self, img, img_metas, return_multi_level=False, **kwargs):
         """Extract features of images."""
         img = self.prepare_inputs(img)
         x, _ = self.image_encoder(img[0])
         x, depth = self.img_view_transformer([x] + img[1:8])
+        if return_multi_level:
+            multi_feats, final_feat = self.bev_encoder(x, return_multi_level=True)
+            return [final_feat], depth, multi_feats
         x = self.bev_encoder(x)
         return [x], depth
 
-    def extract_feat(self, points, img, img_metas, **kwargs):
+    def extract_feat(self, points, img, img_metas, return_multi_level=False, **kwargs):
         """Extract features from images and points."""
+        if return_multi_level:
+            img_feats, depth, img_multi = self.extract_img_feat(
+                img, img_metas, return_multi_level=True, **kwargs)
+            return (img_feats, None, depth, img_multi)
         img_feats, depth = self.extract_img_feat(img, img_metas, **kwargs)
         pts_feats = None
         return (img_feats, pts_feats, depth)
+
+    def multi_level_fuse(self, img_multi, pts_multi):
+        """多层级融合：对 backbone 各 stage 输出做门控融合。
+
+        仅对 neck 实际消费的层级（self.fusion_level_ids）做融合，其余层级
+        原样透传，从而保证：
+        1) 返回的列表长度与 backbone 输出一致，neck 的 input_feature_index
+           索引语义不受影响；
+        2) 每个 level_fusions 模块都被消费，参数都有梯度（DDP 安全）。
+
+        Args:
+            img_multi (list[torch.Tensor]): 图像 BEV 多尺度特征
+            pts_multi (list[torch.Tensor]): 激光 BEV 多尺度特征
+
+        Returns:
+            list[torch.Tensor]: 融合后的多尺度特征，送入 neck
+        """
+        # 层级 id -> 门控融合模块下标
+        level2idx = {lid: i for i, lid in enumerate(self.fusion_level_ids)}
+        fused_multi = []
+        for lid, (img_f, pts_f) in enumerate(zip(img_multi, pts_multi)):
+            if lid not in level2idx:
+                # neck 不消费该层级，直接透传避免引入无梯度参数
+                fused_multi.append(img_f)
+                continue
+            gate = self.level_fusions[level2idx[lid]](
+                torch.cat([img_f, pts_f], dim=1))
+            img_gate = gate[:, 0:1, :, :]
+            pts_gate = gate[:, 1:2, :, :]
+            fused_multi.append(img_gate * img_f + pts_gate * pts_f)
+        return fused_multi
 
     def forward_train(self,
                       points=None,
@@ -579,6 +632,13 @@ class FastBEVOCC(FastBEV):
 
     Args:
         occ_head (dict | None): Configuration dict of the occupancy head.
+        pts_occ_head (dict | None): 激光专用 OCC head 配置。若不为 None，
+            从激光 BEV 特征直接预测 OCC，与主 OCC head 加权融合，
+            提升几何边界精度。训练时两个 head 都有 loss 监督。
+        occ_fusion_weight (float): 可学习融合权重的**初始值**：融合权重
+            alpha = sigmoid(occ_fuse_logit)（occ_fuse_logit 为 nn.Parameter），
+            训练中由主 OCC loss 的梯度自动学习，推理时按 alpha 融合主 OCC 与
+            激光 OCC（alpha 初始 = occ_fusion_weight，默认 0.7）。
         det_downsample (dict | None): Configuration dict of the detection
             branch downsample layer. If None, the detection head consumes the
             original BEV feature directly. 支持可选的 'detach' 键
@@ -592,11 +652,20 @@ class FastBEVOCC(FastBEV):
         fusion (dict | None): BEV 融合方式配置。支持：
             - type='concat': 通道维拼接后用 1x1 conv 降维到 out_channels。
             - type='add': 逐元素相加（需两分支通道数相同）。
+            - type='gated': 门控融合，对两分支分别预测门控权重再加权求和，
+              配置需含 in_channels_img / in_channels_pts / out_channels /
+              hidden_channels（可选，默认 64）。
             若为 None，则不启用激光分支，行为与纯视觉 FastBEVOCC 一致。
+        multi_level_fusion (bool): 是否启用多层级融合。若为 True，在 BEV
+            backbone 的每个 stage 输出后都做一次跨模态融合，再送入 neck。
+            要求 img/pts 的 bev_encoder_backbone 都输出相同数量的多尺度特征
+            （backbone_output_ids 长度一致），且对应 stage 通道数相同。
     """
 
     def __init__(self,
                  occ_head=None,
+                 pts_occ_head=None,
+                 occ_fusion_weight=0.7,
                  det_downsample=None,
                  pts_voxel_layer=None,
                  pts_voxel_encoder=None,
@@ -604,12 +673,27 @@ class FastBEVOCC(FastBEV):
                  pts_bev_encoder_backbone=None,
                  pts_bev_encoder_neck=None,
                  fusion=None,
+                 reverse_fusion=None,
+                 multi_level_fusion=False,
                  init_cfg=None,
                  **kwargs):
         super(FastBEVOCC, self).__init__(init_cfg=init_cfg, **kwargs)
+        self.multi_level_fusion = multi_level_fusion
         self.occ_head = None
         if occ_head is not None:
             self.occ_head = builder.build_head(occ_head)
+        # 激光专用 OCC head
+        self.pts_occ_head = None
+        if pts_occ_head is not None:
+            self.pts_occ_head = builder.build_head(pts_occ_head)
+            # 可学习融合权重：alpha = sigmoid(occ_fuse_logit)
+            # 训练时把主 OCC 与激光 OCC 的融合结果直接送进 occ_head.loss，
+            # 梯度经融合表达式回传到 occ_fuse_logit，alpha 自动学习最优权重；
+            # occ_fusion_weight 仅作为 alpha 的初始值（默认 0.7 → 主 OCC 占 70%）
+            import math
+            init_logit = math.log(occ_fusion_weight / (1 - occ_fusion_weight))
+            self.occ_fuse_logit = nn.Parameter(
+                torch.tensor(init_logit, dtype=torch.float32))
         self.det_downsample = None
         self.detach_det = False
         if det_downsample is not None:
@@ -632,6 +716,7 @@ class FastBEVOCC(FastBEV):
         self.pts_bev_encoder_backbone = None
         self.pts_bev_encoder_neck = None
         self.fusion = None
+        self.rev_enabled = False
 
         if self.with_lidar:
             assert pts_voxel_layer is not None, \
@@ -664,9 +749,108 @@ class FastBEVOCC(FastBEV):
                     bias=False)
             elif fusion_type == 'add':
                 self.fusion = nn.Identity()
+            elif fusion_type == 'gated':
+                # 门控融合：分别预测图像/激光分支的空间门控权重，加权求和
+                from mmcv.cnn import ConvModule
+                in_c_img = fusion['in_channels_img']
+                in_c_pts = fusion['in_channels_pts']
+                out_c = fusion['out_channels']
+                hid_c = fusion.get('hidden_channels', 64)
+                # 投影到相同通道数
+                self.img_proj = nn.Conv2d(in_c_img, out_c, 1, bias=False)
+                self.pts_proj = nn.Conv2d(in_c_pts, out_c, 1, bias=False)
+                # 门控网络：concat 两分支特征 → 预测 2 通道门控权重
+                self.gate_net = nn.Sequential(
+                    ConvModule(out_c * 2, hid_c, 3, padding=1,
+                               norm_cfg=dict(type='BN'), act_cfg=dict(type='ReLU')),
+                    nn.Conv2d(hid_c, 2, 1),
+                    nn.Sigmoid(),
+                )
+                self.fusion = nn.Identity()  # 占位，实际融合在 fuse_bev_feats 中
             else:
                 raise ValueError(f"Unsupported fusion type: {fusion_type}")
             self.fusion_type = fusion_type
+
+            # ---- 反向融合（方案 A）：图像语义反哺激光分支 ----
+            # 正向融合是「激光几何 → 图像语义分支」；这里再建一组结构对称的门控，
+            # 用融合特征（已含图像语义）反过来调制激光 BEV 特征，输出送回激光分支
+            # （当前用于 pts_occ_head）。激光有几何但缺语义、图像有语义但缺几何，
+            # 双向互补。
+            # 注意：该模块只在 pts_occ_head 存在时才会被调用，若配置了
+            # reverse_fusion 但没建 pts_occ_head，其参数拿不到梯度，
+            # DDP(find_unused_parameters=False) 会报 reduction 未完成。
+            if reverse_fusion is not None:
+                from mmcv.cnn import ConvModule
+                rev_type = reverse_fusion.get('type', 'gated')
+                if rev_type != 'gated':
+                    raise ValueError(
+                        f'Unsupported reverse fusion type: {rev_type}')
+                rev_out_c = reverse_fusion['out_channels']
+                rev_hid_c = reverse_fusion.get('hidden_channels', 64)
+                self.rev_pts_proj = nn.Conv2d(
+                    reverse_fusion['in_channels_pts'],
+                    rev_out_c,
+                    1,
+                    bias=False)
+                self.rev_img_proj = nn.Conv2d(
+                    reverse_fusion['in_channels_img'],
+                    rev_out_c,
+                    1,
+                    bias=False)
+                self.rev_gate_net = nn.Sequential(
+                    ConvModule(
+                        rev_out_c * 2,
+                        rev_hid_c,
+                        3,
+                        padding=1,
+                        norm_cfg=dict(type='BN'),
+                        act_cfg=dict(type='ReLU')),
+                    nn.Conv2d(rev_hid_c, 2, 1),
+                    nn.Sigmoid(),
+                )
+                self.rev_enabled = True
+
+            # ---- 多层级融合：为 neck 实际消费的每个 stage 建门控融合单元 ----
+            # 注意：只对 neck 真正消费的层级建融合模块。图像 neck（FPN_LSS）
+            # 默认只用 input_feature_index 指定的层（如 (0, 2)），未被消费的
+            # 层级若也建融合模块，其参数永远拿不到梯度，DDP 会直接报
+            # "Expected to have finished reduction" 崩溃。
+            if self.multi_level_fusion:
+                from mmcv.cnn import ConvModule
+                # 从 backbone 配置中读取各 stage 输出通道数
+                img_ch = kwargs.get('img_bev_encoder_backbone', {}).get(
+                    'num_channels', None)
+                pts_ch = pts_bev_encoder_backbone.get('num_channels', None)
+                assert img_ch is not None and pts_ch is not None, \
+                    "多层级融合需要 backbone 配置 num_channels"
+                assert len(img_ch) == len(pts_ch), \
+                    f"图像/激光 backbone stage 数不一致: {len(img_ch)} vs {len(pts_ch)}"
+                self.num_fusion_levels = len(img_ch)
+                # 读取 neck 实际消费的层级。注意必须从"已构建的 neck 实例"
+                # 读取：FPN_LSS 的 input_feature_index 有类默认值 (0, 2)，
+                # 配置里常常不显式写，读配置 dict 会拿到兜底值而误判。
+                neck = getattr(self, 'img_bev_encoder_neck', None)
+                if neck is not None and hasattr(neck, 'input_feature_index'):
+                    consumed = neck.input_feature_index
+                else:
+                    consumed = list(range(self.num_fusion_levels))
+                self.fusion_level_ids = sorted(set(int(i) for i in consumed))
+                for lid in self.fusion_level_ids:
+                    assert 0 <= lid < self.num_fusion_levels, \
+                        f"neck 消费的层级 {lid} 超出 backbone 输出层数"
+                self.level_fusions = nn.ModuleList()
+                hid_c = fusion.get('hidden_channels', 64)
+                for lid in self.fusion_level_ids:
+                    # 每个被消费的 level 一个门控融合
+                    level_gate = nn.Sequential(
+                        ConvModule(img_ch[lid] + pts_ch[lid], hid_c, 3,
+                                   padding=1,
+                                   norm_cfg=dict(type='BN'),
+                                   act_cfg=dict(type='ReLU')),
+                        nn.Conv2d(hid_c, 2, 1),
+                        nn.Sigmoid(),
+                    )
+                    self.level_fusions.append(level_gate)
 
     @torch.no_grad()
     @force_fp32()
@@ -696,25 +880,34 @@ class FastBEVOCC(FastBEV):
         coors_batch = torch.cat(coors_batch, dim=0)
         return voxels, num_points, coors_batch
 
-    def extract_pts_feat(self, points):
+    def extract_pts_feat(self, points, return_multi_level=False):
         """提取激光 BEV 特征。
 
         Args:
             points (list[torch.Tensor]): 每帧点云。
+            return_multi_level (bool): 是否返回 backbone 多尺度特征列表。
 
         Returns:
-            torch.Tensor: BEV 特征 [B, C, H, W]
+            torch.Tensor | tuple:
+                - return_multi_level=False: 最终 BEV 特征 [B, C, H, W]
+                - return_multi_level=True: (multi_feats, final_feat)
+                  multi_feats 是 backbone 各 stage 输出列表
         """
         voxels, num_points, coors = self.voxelize(points)
         voxel_features = self.pts_voxel_encoder(voxels, num_points, coors)
         batch_size = coors[-1, 0].item() + 1
         x = self.pts_middle_encoder(voxel_features, coors, batch_size)
+        multi_feats = None
         if self.pts_bev_encoder_backbone is not None:
             x = self.pts_bev_encoder_backbone(x)
+            if return_multi_level and isinstance(x, (list, tuple)):
+                multi_feats = list(x)
         if self.pts_bev_encoder_neck is not None:
             x = self.pts_bev_encoder_neck(x)
             if isinstance(x, (list, tuple)):
                 x = x[0]
+        if return_multi_level:
+            return multi_feats, x
         return x
 
     def fuse_bev_feats(self, img_bev, pts_bev):
@@ -732,9 +925,43 @@ class FastBEVOCC(FastBEV):
             x = self.fusion(x)
         elif self.fusion_type == 'add':
             x = img_bev + pts_bev
+        elif self.fusion_type == 'gated':
+            # 投影到相同通道数
+            img_feat = self.img_proj(img_bev)
+            pts_feat = self.pts_proj(pts_bev)
+            # 预测门控权重 [B, 2, H, W]
+            gate = self.gate_net(torch.cat([img_feat, pts_feat], dim=1))
+            img_gate = gate[:, 0:1, :, :]
+            pts_gate = gate[:, 1:2, :, :]
+            # 加权求和
+            x = img_gate * img_feat + pts_gate * pts_feat
         else:
             raise ValueError(f"Unsupported fusion type: {self.fusion_type}")
         return x
+
+    def rev_fuse_bev_feats(self, pts_bev, fused_bev):
+        """反向融合：用融合特征（含图像语义）调制激光 BEV 特征。
+
+        与 ``fuse_bev_feats`` 的门控结构对称，但输出送回激光分支，使激光的
+        几何特征获得图像语义上下文（方案 A：双向融合）。未启用
+        ``reverse_fusion`` 时原样返回。
+
+        Args:
+            pts_bev (torch.Tensor): 激光 BEV 特征 [B, C_pts, H, W]
+            fused_bev (torch.Tensor): 融合 BEV 特征（含图像语义）
+                [B, C_img, H, W]
+
+        Returns:
+            torch.Tensor: 调制后的激光 BEV 特征 [B, C_out, H, W]
+        """
+        if not self.rev_enabled:
+            return pts_bev
+        pts_feat = self.rev_pts_proj(pts_bev)
+        img_feat = self.rev_img_proj(fused_bev)
+        gate = self.rev_gate_net(torch.cat([pts_feat, img_feat], dim=1))
+        pts_gate = gate[:, 0:1, :, :]
+        img_gate = gate[:, 1:2, :, :]
+        return pts_gate * pts_feat + img_gate * img_feat
 
     def _det_feats(self, img_feats):
         """检测分支特征：200x200@0.4m -> 100x100@0.8m（物理分辨率不变）。
@@ -773,22 +1000,39 @@ class FastBEVOCC(FastBEV):
             dict: Losses of detection branch, depth branch (if use_depth)
                 and occupancy branch (if occ_head is not None).
         """
-        img_feats, _, depth = self.extract_feat(
-            points, img=img_inputs, img_metas=img_metas, **kwargs)
+        if self.multi_level_fusion and self.with_lidar:
+            # 多层级融合：提取图像+激光的多尺度特征，逐 stage 融合
+            img_feats, _, depth, img_multi = self.extract_feat(
+                points, img=img_inputs, img_metas=img_metas,
+                return_multi_level=True, **kwargs)
+            pts_multi, pts_bev_final = self.extract_pts_feat(
+                points, return_multi_level=True)
+            # 逐 stage 融合
+            fused_multi = self.multi_level_fuse(img_multi, pts_multi)
+            # 融合后的多尺度特征送入图像 neck
+            fused_bev_neck = self.img_bev_encoder_neck(fused_multi)
+            if isinstance(fused_bev_neck, (list, tuple)):
+                fused_bev_neck = fused_bev_neck[0]
+            # 最后再做一次全局门控融合（保证 fusion 模块参数被使用）
+            fused_bev = self.fuse_bev_feats(fused_bev_neck, pts_bev_final)
+            bev_feats = [fused_bev]
+        else:
+            img_feats, _, depth = self.extract_feat(
+                points, img=img_inputs, img_metas=img_metas, **kwargs)
+            # 多模态融合：图像 BEV + 激光 BEV（仅最后一层）
+            if self.with_lidar:
+                pts_bev = self.extract_pts_feat(points)
+                fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+                bev_feats = [fused_bev]
+            else:
+                bev_feats = img_feats
+
         if self.use_depth:
             gt_depth = kwargs['gt_depth']
             loss_depth = self.img_view_transformer.get_depth_loss(gt_depth, depth)
             losses = dict(loss_depth=loss_depth)
         else:
             losses = dict()
-
-        # 多模态融合：图像 BEV + 激光 BEV
-        if self.with_lidar:
-            pts_bev = self.extract_pts_feat(points)
-            fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
-            bev_feats = [fused_bev]
-        else:
-            bev_feats = img_feats
 
         losses_pts = self.forward_pts_train(self._det_feats(bev_feats),
                                             gt_bboxes_3d, gt_labels_3d,
@@ -798,6 +1042,30 @@ class FastBEVOCC(FastBEV):
             voxel_semantics = kwargs['voxel_semantics']
             mask_camera = kwargs['mask_camera']
             occ_pred = self.occ_head(bev_feats[0])
+
+            # 激光专用 OCC head：与主 OCC 做可学习加权融合
+            if self.pts_occ_head is not None and self.with_lidar:
+                # 获取激光 BEV 特征（最终输出，用于 pts_occ_head）
+                if self.multi_level_fusion:
+                    pts_bev_for_occ = pts_bev_final
+                else:
+                    pts_bev_for_occ = pts_bev
+                # 方案 A 反向融合：用融合特征（含图像语义）调制激光分支
+                pts_bev_for_occ = self.rev_fuse_bev_feats(
+                    pts_bev_for_occ, bev_feats[0])
+                pts_occ_pred = self.pts_occ_head(pts_bev_for_occ)
+                # alpha = sigmoid(occ_fuse_logit)，可学习标量：
+                # 主 OCC loss 直接作用在融合结果上，梯度回传到 occ_fuse_logit，
+                # 训练自动决定图像 OCC / 激光 OCC 的加权比例
+                alpha = torch.sigmoid(self.occ_fuse_logit)
+                occ_pred = alpha * occ_pred + (1 - alpha) * pts_occ_pred
+                # 激光分支辅助监督（权重 0.5），保证 pts_occ_head 自身可训练
+                pts_losses_occ = self.pts_occ_head.loss(
+                    pts_occ_pred, voxel_semantics, mask_camera)
+                for k, v in pts_losses_occ.items():
+                    losses[f'pts_{k}'] = 0.5 * v
+
+            # 融合后的 OCC 预测参与主监督（CE + aux）
             losses_occ = self.occ_head.loss(occ_pred, voxel_semantics,
                                             mask_camera)
             losses.update(losses_occ)
@@ -815,16 +1083,27 @@ class FastBEVOCC(FastBEV):
             list[dict]: Each dict contains 'pts_bbox' (3D object detection
                 results) and 'occ' (occupancy prediction, shape (Dx, Dy, Dz)).
         """
-        img_feats, _, _ = self.extract_feat(
-            points, img=img, img_metas=img_metas, **kwargs)
-
-        # 多模态融合：图像 BEV + 激光 BEV
-        if self.with_lidar:
-            pts_bev = self.extract_pts_feat(points)
-            fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+        if self.multi_level_fusion and self.with_lidar:
+            img_feats, _, _, img_multi = self.extract_feat(
+                points, img=img, img_metas=img_metas,
+                return_multi_level=True, **kwargs)
+            pts_multi, pts_bev_final = self.extract_pts_feat(
+                points, return_multi_level=True)
+            fused_multi = self.multi_level_fuse(img_multi, pts_multi)
+            fused_bev_neck = self.img_bev_encoder_neck(fused_multi)
+            if isinstance(fused_bev_neck, (list, tuple)):
+                fused_bev_neck = fused_bev_neck[0]
+            fused_bev = self.fuse_bev_feats(fused_bev_neck, pts_bev_final)
             bev_feats = [fused_bev]
         else:
-            bev_feats = img_feats
+            img_feats, _, _ = self.extract_feat(
+                points, img=img, img_metas=img_metas, **kwargs)
+            if self.with_lidar:
+                pts_bev = self.extract_pts_feat(points)
+                fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+                bev_feats = [fused_bev]
+            else:
+                bev_feats = img_feats
 
         bbox_list = [dict() for _ in range(len(img_metas))]
         bbox_pts = self.simple_test_pts(self._det_feats(bev_feats),
@@ -833,6 +1112,20 @@ class FastBEVOCC(FastBEV):
             result_dict['pts_bbox'] = pts_bbox
         if self.occ_head is not None:
             occ_pred = self.occ_head(bev_feats[0])
+            # 激光 OCC head 融合
+            if self.pts_occ_head is not None and self.with_lidar:
+                if self.multi_level_fusion:
+                    # 多层级融合时，pts_bev 需要重新计算
+                    _, pts_bev_for_occ = self.extract_pts_feat(
+                        points, return_multi_level=True)
+                else:
+                    pts_bev_for_occ = pts_bev
+                # 方案 A 反向融合：用融合特征（含图像语义）调制激光分支
+                pts_bev_for_occ = self.rev_fuse_bev_feats(
+                    pts_bev_for_occ, bev_feats[0])
+                pts_occ_pred = self.pts_occ_head(pts_bev_for_occ)
+                alpha = torch.sigmoid(self.occ_fuse_logit)
+                occ_pred = alpha * occ_pred + (1 - alpha) * pts_occ_pred
             occ_res = self.occ_head.get_occ(occ_pred)
             for result_dict, occ in zip(bbox_list, occ_res):
                 result_dict['occ'] = occ
@@ -843,15 +1136,27 @@ class FastBEVOCC(FastBEV):
                       img_metas=None,
                       img_inputs=None,
                       **kwargs):
-        img_feats, _, _ = self.extract_feat(
-            points, img=img_inputs, img_metas=img_metas, **kwargs)
-        # 多模态融合
-        if self.with_lidar:
-            pts_bev = self.extract_pts_feat(points)
-            fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+        if self.multi_level_fusion and self.with_lidar:
+            img_feats, _, _, img_multi = self.extract_feat(
+                points, img=img_inputs, img_metas=img_metas,
+                return_multi_level=True, **kwargs)
+            pts_multi, pts_bev_final = self.extract_pts_feat(
+                points, return_multi_level=True)
+            fused_multi = self.multi_level_fuse(img_multi, pts_multi)
+            fused_bev_neck = self.img_bev_encoder_neck(fused_multi)
+            if isinstance(fused_bev_neck, (list, tuple)):
+                fused_bev_neck = fused_bev_neck[0]
+            fused_bev = self.fuse_bev_feats(fused_bev_neck, pts_bev_final)
             bev_feats = [fused_bev]
         else:
-            bev_feats = img_feats
+            img_feats, _, _ = self.extract_feat(
+                points, img=img_inputs, img_metas=img_metas, **kwargs)
+            if self.with_lidar:
+                pts_bev = self.extract_pts_feat(points)
+                fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
+                bev_feats = [fused_bev]
+            else:
+                bev_feats = img_feats
         assert self.with_pts_bbox
         outs = self.pts_bbox_head(self._det_feats(bev_feats))
         if self.occ_head is not None:

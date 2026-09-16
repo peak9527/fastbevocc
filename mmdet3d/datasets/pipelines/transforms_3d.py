@@ -4,6 +4,7 @@ import warnings
 
 import cv2
 import numpy as np
+import torch
 from pyquaternion.quaternion import Quaternion
 from mmcv import is_tuple_of
 from mmcv.utils import build_from_cfg
@@ -64,6 +65,163 @@ class RandomDropPointsColor(object):
         """str: Return a string that describes the module."""
         repr_str = self.__class__.__name__
         repr_str += f'(drop_ratio={self.drop_ratio})'
+        return repr_str
+
+
+@PIPELINES.register_module()
+class RandomPointDrop(object):
+    """随机丢弃激光点（模拟点云稀疏 / 遮挡 / 远距衰减）。
+
+    对每帧点云按 ``drop_ratio`` 概率做逐点伯努利采样，保留约
+    ``(1 - drop_ratio)`` 的点。与 ``RandomDropPointsColor`` 不同，本变换丢弃的是
+    点本身（而非属性），用于提升激光分支对点云稀疏场景的鲁棒性。
+
+    Note:
+        检测/占用任务的 GT（gt_bboxes_3d / voxel_semantics）来自标注而非点云，
+        不随点云变化，因此本变换可安全用于点云仅参与 BEV 特征提取的模型
+        （如 FastBEVOCC 的多模态融合分支）。
+
+    Args:
+        drop_ratio (float, optional): 每个点被丢弃的概率，取值 [0, 1)。
+            Defaults to 0.2.
+        min_points (int, optional): 保留点数下限。若原图点数不足，或丢弃后
+            剩余点数低于该值，则跳过本次丢弃，避免把点云丢空。
+            Defaults to 1000.
+    """
+
+    def __init__(self, drop_ratio=0.2, min_points=1000):
+        assert isinstance(drop_ratio, (int, float)) and 0 <= drop_ratio < 1, \
+            f'invalid drop_ratio value {drop_ratio}'
+        assert min_points >= 0, f'invalid min_points value {min_points}'
+        self.drop_ratio = drop_ratio
+        self.min_points = min_points
+
+    def __call__(self, input_dict):
+        """Call function to randomly drop points.
+
+        Args:
+            input_dict (dict): Result dict from loading pipeline.
+
+        Returns:
+            dict: Results after dropping points, 'points' key is updated
+                in the result dict.
+        """
+        points = input_dict['points']
+        tensor = points.tensor
+        num_points = tensor.shape[0]
+        if self.drop_ratio <= 0 or num_points <= self.min_points:
+            return input_dict
+
+        keep = torch.rand(
+            num_points, device=tensor.device) >= self.drop_ratio
+        if int(keep.sum()) < self.min_points:
+            return input_dict
+
+        input_dict['points'] = points.new_point(tensor[keep])
+        return input_dict
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(drop_ratio={self.drop_ratio}, '
+        repr_str += f'min_points={self.min_points})'
+        return repr_str
+
+
+@PIPELINES.register_module()
+class RandomIntensityJitter(object):
+    """激光强度（反射率）扰动。
+
+    支持三种扰动，可自由组合：
+
+    - 加性高斯噪声：``intensity += N(0, jitter_std)``，可选截断到
+      ``±clip_range``；
+    - 乘性缩放：``intensity *= U(scale_range)``；
+    - 整帧置零：以 ``zero_ratio`` 概率把该帧 intensity 全部置 0，
+      模拟反射率信息缺失。
+
+    Note:
+        本仓库 yk_c1 点云的 intensity 为原始 0~255 刻度（实测均值约 15、
+        99 分位约 81），因此 ``jitter_std`` 使用绝对刻度，建议 2~8。
+        若输入点云已做过归一化，请相应调小该值。
+
+    Args:
+        jitter_std (float, optional): 加性高斯噪声标准差。Defaults to 4.0.
+        clip_range (float | None, optional): 噪声截断范围，None 表示不截断。
+            Defaults to 10.0.
+        scale_range (tuple[float] | None, optional): 乘性缩放区间，
+            如 (0.8, 1.2)；None 表示不缩放。Defaults to None.
+        zero_ratio (float, optional): 整帧 intensity 置零的概率。
+            Defaults to 0.0.
+        intensity_dim (int, optional): intensity 在点特征中的列索引。
+            Defaults to 3 (x, y, z, intensity, ...).
+    """
+
+    def __init__(self,
+                 jitter_std=4.0,
+                 clip_range=10.0,
+                 scale_range=None,
+                 zero_ratio=0.0,
+                 intensity_dim=3):
+        assert jitter_std >= 0, f'invalid jitter_std value {jitter_std}'
+        assert 0 <= zero_ratio <= 1, f'invalid zero_ratio value {zero_ratio}'
+        if scale_range is not None:
+            assert is_tuple_of(scale_range, (int, float)) and \
+                len(scale_range) == 2 and scale_range[0] <= scale_range[1], \
+                f'invalid scale_range value {scale_range}'
+        self.jitter_std = jitter_std
+        self.clip_range = clip_range
+        self.scale_range = scale_range
+        self.zero_ratio = zero_ratio
+        self.intensity_dim = intensity_dim
+
+    def __call__(self, input_dict):
+        """Call function to jitter point intensity.
+
+        Args:
+            input_dict (dict): Result dict from loading pipeline.
+
+        Returns:
+            dict: Results after jittering intensity, 'points' key is updated
+                in the result dict.
+        """
+        points = input_dict['points']
+        tensor = points.tensor
+        dim = self.intensity_dim
+        if tensor.shape[1] <= dim:
+            # 点特征里没有 intensity 通道，直接跳过
+            return input_dict
+
+        tensor = tensor.clone()
+        # 整帧强度缺失
+        if self.zero_ratio > 0 and np.random.rand() < self.zero_ratio:
+            tensor[:, dim] = 0
+            input_dict['points'] = points.new_point(tensor)
+            return input_dict
+
+        inten = tensor[:, dim]
+        if self.jitter_std > 0:
+            noise = torch.randn(
+                inten.shape, device=tensor.device) * self.jitter_std
+            if self.clip_range is not None:
+                noise = noise.clamp(-self.clip_range, self.clip_range)
+            inten = inten + noise
+        if self.scale_range is not None:
+            lo, hi = self.scale_range
+            scale = torch.empty(
+                inten.shape, device=tensor.device).uniform_(lo, hi)
+            inten = inten * scale
+        # 强度非负
+        tensor[:, dim] = inten.clamp(min=0.0)
+
+        input_dict['points'] = points.new_point(tensor)
+        return input_dict
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(jitter_std={self.jitter_std}, '
+        repr_str += f'clip_range={self.clip_range}, '
+        repr_str += f'scale_range={self.scale_range}, '
+        repr_str += f'zero_ratio={self.zero_ratio})'
         return repr_str
 
 
