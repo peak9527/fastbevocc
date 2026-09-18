@@ -485,7 +485,7 @@ v3（`fastbev-occ-r50-cbgs-fusion-v3.py`）针对该问题做了 4 项改造。
 | # | 优化 | 配置位置 | 说明 |
 |---|------|---------|------|
 | 1 | 增强体素特征 | `pts_voxel_encoder` | `PillarFeatureNet` 新增 `with_height_stat`(+4: z_max/z_min/z_mean/z_std)、`with_density`(+1)、`with_intensity_stat`(+2)，共 +7 维；两层 MLP 输出 128ch |
-| 2 | 多层级融合 | `multi_level_fusion=True` | 在 BEV backbone 的每个 stage 输出后即做门控融合，再送入 FPN neck；激光信息更早参与特征提取 |
+| 2 | 多层级融合 | `multi_level_fusion=True` | 在 BEV backbone 的每个 stage 输出后即做门控融合，再送入 FPN neck；激光信息更早参与特征提取。**v3.2 起升级为级联式**（`cascade_fusion=True`，见第 12 章），使 neck 未直接消费的 level1 也能参与融合并获得梯度 |
 | 3 | OCC 专用激光头 | `pts_occ_head` + `occ_fusion_weight` | 从激光 BEV 特征直接预测 OCC，与主 OCC 通过可学习权重 `alpha=sigmoid(occ_fuse_logit)` 融合；训练时双路监督（激光路 0.5 权重） |
 | 4 | 深度引导增强 | `img_view_transformer.loss_depth_weight` | 0.125 → 0.25（实测 1.0 会过度扰动预训练主干、拖慢检测/OCC 收敛） |
 
@@ -522,17 +522,21 @@ losses['pts_loss_occ'] = 0.5 * pts_occ_head.loss(occ_pred_lidar, ...)
 
 ### 10.3 关键实现细节
 
-- **只对 neck 消费的层级建融合模块**：`FPN_LSS` 默认 `input_feature_index=(0, 2)`，
-  未被消费的层级若也建融合单元，其参数永远拿不到梯度，DDP（`find_unused_parameters=False`）
-  会报 `Expected to have finished reduction` 崩溃。实现中从**已构建的 neck 实例**读取
-  `input_feature_index`（而非配置 dict，其有类默认值会误判），只对 `fusion_level_ids` 建融合，
-  其余层级原样透传。
+- **只对 neck 消费的层级建融合模块（v3 原行为，`cascade_fusion=False`）**：
+  `FPN_LSS` 默认 `input_feature_index=(0, 2)`，未被消费的层级若也建融合单元，
+  其参数永远拿不到梯度，DDP（`find_unused_parameters=False`）会报
+  `Expected to have finished reduction` 崩溃。实现中从**已构建的 neck 实例**读取
+  `input_feature_index`（而非配置 dict，其有类默认值会误判），只对 `fusion_level_ids`
+  建融合，其余层级原样透传。
+  **代价**：level1（50×50×256）被结构性浪费。v3.2 用级联方案解决，见第 12 章
+  ——非级联行为仍是默认，可复现。
 - **`backbone_output_ids=[0,1,2]`**：激光 BEV backbone（`CustomResNet`，`num_layer=[2,2,2]`，
   `num_channels=[128,256,512]`）输出全部 3 层以配合多层级融合；`with_cp=False` 规避
   DDP + 多路径消费的兼容性问题。
 - **新分支 5x 学习率**：`paramwise_cfg` 给 `pts_*`、`img_proj`、`pts_proj`、`gate_net`、
-  `level_fusions`、`occ_fuse_logit` 设 `lr_mult=5.0`（1e-4 → 5e-4），因其为随机初始化，
-  而视觉主干与 `occ_head` 来自基线 `epoch_24_ema.pth` 预训练权重。
+  `level_fusions`、`level_downs`（v3.2 新增）、`occ_fuse_logit` 设 `lr_mult=5.0`
+  （1e-4 → 5e-4），因其为随机初始化，而视觉主干与 `occ_head` 来自基线预训练权重
+  （v3 为 `epoch_24_ema.pth`，v3.2 起为 `data/ckpts/epoch_30_ema_custom.pth`）。
 
 ### 10.4 训练配置
 
@@ -540,7 +544,7 @@ losses['pts_loss_occ'] = 0.5 * pts_occ_head.loss(occ_pred_lidar, ...)
 |------|-----|
 | 配置文件 | `configs/fastbev/paper/fastbev-occ-r50-cbgs-fusion-v3.py` |
 | 输出目录 | `work_dirs/fastbev-occ-r50-cbgs-fusion-v3/` |
-| 预训练权重 | `work_dirs/fastbev-occ-r50-cbgs-custom/epoch_24_ema.pth`（`load_from`） |
+| 预训练权重 | `data/ckpts/epoch_30_ema_custom.pth`（`load_from`，v3.2 起；命中 482/487，未命中项见 12.3） |
 | batch / 优化器 | 2 GPU × `samples_per_gpu=4`（总 batch 8）、AdamW lr 1e-4、warmup 300 iter、step [18, 21]、24 epoch |
 | 显存 | 每卡约 19.6 GB / 24 GB |
 
@@ -686,6 +690,176 @@ reverse_fusion=dict(
 
 > 注意：本次重启同时引入了三类变化（对齐修复 / 激光增强 / 双向融合）。
 > 若要单独归因某一项的收益，需各自单独训练一次做消融。
+
+---
+
+## 12. v3.2：级联门控融合 + 门控 bias 初始化（2026-09-16）
+
+v3.1 训练过程中定位到两个会实质影响融合收益的设计缺陷，本轮一并修复。
+
+### 12.1 【缺陷 1】level1 被结构性浪费
+
+**根因**：`FPN_LSS.forward` 硬编码只消费两个输入层级。
+
+```python
+# mmdet3d/models/necks/lss_fpn.py
+def forward(self, feats):
+    x2, x1 = feats[self.input_feature_index[0]], feats[self.input_feature_index[1]]
+    ...
+    x = torch.cat([x2, x1], dim=1)      # in_channels = 512 + 128 = 640
+```
+
+图像 BEV backbone（`CustomResNet`，`stride=[2,2,2]`）输出 3 层：
+level0 = 100×100×128、level1 = 50×50×256、level2 = 25×25×512；neck 取 `(0, 2)`。
+**level1 不被消费是结构性的，不是配置遗漏** → 非级联模式下给它建融合模块则永远
+拿不到梯度（DDP 报错），只能原样透传，激光的中层信息全部浪费。
+
+**方案：级联门控融合**（`cascade_fusion=True`）
+
+```
+fused[0] = Gate0([img0, pts0])                     100×100×128  ← neck 消费
+fused[1] = Gate1([img1, pts1, down(fused[0])])      50×50×256
+fused[2] = Gate2([img2, pts2, down(fused[1])])      25×25×512  ← neck 消费
+```
+
+- 为**所有** level 建门控融合；level i 额外消费上一层融合结果
+  （`level_downs`：`Conv2d(C_prev, C_cur, 3, stride=2)` 下采样 + 对齐通道）
+- 门控输出通道 2 → 3（`g_img` / `g_pts` / `g_prev`），三者逐元素加权求和
+- level1 经 level2 的级联路径回传拿到梯度 → **DDP 安全**
+- **neck / backbone 结构与权重零改动**，新增模块全为随机初始化
+
+评估过但未采用的备选：
+
+| 备选 | 不采用原因 |
+|------|-----------|
+| 放开 `find_unused_parameters=True` | 只让 DDP 不报错，level1 参数仍不更新，白占显存 + 5~15% 通信开销 |
+| 扩展 neck 为三输入（加 `mid_index`） | 需改 `lss_fpn.py` 结构，TRT 导出要重验 |
+
+### 12.2 【缺陷 2】门控初始 50/50，冲掉预训练特征
+
+门控输出层 `nn.Conv2d(hid, N, 1)` 的 bias 默认全 0、权重零均值随机 →
+训练第 0 步 `sigmoid(·) ≈ 0.5`：
+
+```
+fused ≈ 0.5 · img_bev + 0.5 · pts_bev      # pts_* 分支是随机初始化的新模块
+```
+
+即加载 30e 预训练权重后第一步，已收敛的图像 BEV 特征就被掺进一半随机特征，
+检测 head 与 occ head 的输入分布当场突变。实测吻合：v3 首轮 iter50
+`task0.loss_heatmap = 4.85`（基线同阶段已降到 ~2.0 量级）。
+
+**方案**：门控输出层 bias 初始化为「第一路主导」
+
+```python
+# fastbev.py: _init_gate_bias(gate_seq)
+b = self.gate_bias_first          # 配置 3.0
+conv.bias.fill_(-b)               # 其余路 -3 → sigmoid ≈ 0.05
+conv.bias[0] = +b                 # 第一路 +3 → sigmoid ≈ 0.95
+```
+
+作用于 `level_fusions` / `gate_net` / `rev_gate_net`。注意 `rev_gate_net` 的
+第一路是**激光**分支，因此初始为激光主导，图像语义由网络逐步引入。
+
+### 12.3 配置改动（`fastbev-occ-r50-cbgs-fusion-v3.py`）
+
+```python
+model = dict(
+    ...
+    multi_level_fusion=True,
+    cascade_fusion=True,      # 新增：级联门控融合（level1 也参与）
+    gate_bias_first=3.0,      # 新增：门控输出层 bias，第一路 +3 / 其余 -3
+)
+
+optimizer = dict(
+    paramwise_cfg=dict(custom_keys={
+        ...
+        'level_fusions': dict(lr_mult=5.0),
+        'level_downs':   dict(lr_mult=5.0),   # 新增（否则新模块用 1e-4 欠拟合）
+        ...
+    }))
+
+load_from = 'data/ckpts/epoch_30_ema_custom.pth'
+```
+
+### 12.4 验证（CPU 冒烟，未占 GPU）
+
+```
+cascade_fusion=True   gate_bias_first=3.0   load_from=epoch_30_ema_custom.pth
+
+fusion_level_ids   = [0, 1, 2]      ← level1 已纳入
+len(level_fusions) = 3              len(level_downs) = 2
+level_fusions[0] out_ch=2 bias=[ 3.0, -3.0]
+level_fusions[1] out_ch=3 bias=[ 3.0, -3.0, -3.0]
+level_fusions[2] out_ch=3 bias=[ 3.0, -3.0, -3.0]
+gate_net bias=[3.0,-3.0]    rev_gate_net bias=[3.0,-3.0]
+
+梯度连通性（模拟真实计算图，只让 neck 消费的 level0/level2 反传）：
+  level_fusions[1] grad_norm=789.3   无梯度参数 0/5   ← 靠级联回传，已拿到梯度
+  level_downs[0]   grad_norm=794.0   无梯度参数 0/2
+  level_fusions/level_downs 中 grad 为 None 的参数 = 0   → DDP 安全
+```
+
+初始融合输出相对纯图像输入的偏差：level0 8.6% / level1 14.4% / level2 25.0%
+（level2 偏大是因级联路 `level_downs[1]` 为随机初始化 conv，输出幅度未校准；
+level2 仅 25×25，训练中会收敛，但需留意）。
+
+**权重匹配**（`epoch_30_ema_custom.pth`）：
+
+| 参数 | ckpt | 当前模型 | 处理 |
+|------|------|---------|------|
+| `img_view_transformer.depth_net` | (123,256,1,1) | (152,256,1,1) | 随机初始化 |
+| `occ_head.predicter.2` | (512,512)/(512,) | (528,512)/(528,) | 随机初始化（32 类 vs 33 类） |
+| `img_view_transformer.voxel_coords` | (280000,3) | (640000,3) | 无影响，`__init__` 按当前 grid 动态生成 |
+
+总计命中 482/487；新增随机初始化参数 165 个（`pts_*` 117、`level_fusions` 24、
+`level_downs` 4、`rev_*` 10、`gate_net` 8 等）。
+
+> 曾考虑从 `work_dirs/fastbev-occ-r50-cbgs-fusion/epoch_10_ema.pth`（全仓库唯一
+> 结构完全匹配的权重）补齐上述两层，**最终未采用**：① 该 `depth_net` 是在 v1 的
+> bda 错位深度监督下训练的（见 11.1），映射本身可能错误；② occ 分类层 32 → 33 类
+> 语义不同，直接复制需引入类别映射，风险大于收益。当前随机初始化的 `depth_net`
+> 收敛正常（`loss_depth` 18.8 → 0.91 @ epoch1 过半）。
+
+### 12.5 代价
+
+| 指标 | 增量 |
+|------|------|
+| 参数量 | ≈ +0.4 M（`level_downs` 两个 conv：128→256、256→512） |
+| 理论 FLOPs | ≈ +1~2 GMACs/样本（level1 在 50×50 上多一次 3×3 门控） |
+| 显存 | ≈ +0.2 GB（当前约 19.6 GB/卡，余量约 4 GB） |
+
+### 12.6 当前训练状态
+
+| 时间 | 事件 |
+|------|------|
+| 17:55 | 启动训练（PID 1466316） |
+| 18:28 | 级联融合 + gate bias 的代码与配置落盘 |
+| 18:58 | 该轮训练至 `Epoch[1][1250/2519]`，`loss_depth` 0.91 |
+| — | **该轮加载的是改动前的旧代码**（进程启动时已 import 完毕），需重启才生效 |
+
+启动命令：
+
+```bash
+cd /home/server/workspace/nvidia/fastbev_py
+source /home/server/miniconda3/etc/profile.d/conda.sh && conda activate bev
+bash tools/dist_train.sh configs/fastbev/paper/fastbev-occ-r50-cbgs-fusion-v3.py 2 \
+    --work-dir work_dirs/fastbev-occ-r50-cbgs-fusion-v3
+```
+
+> 启动前必须先终止旧训练进程（占满双卡 + 端口 29500）：`kill -TERM <pid>`，
+> 并确认 `nvidia-smi` 显存回落后再启动，否则新训练会因端口/显存冲突失败。
+
+**启动后必看**：前 200 iter 的 `task0.loss_heatmap` 应明显低于旧一轮的 4.85
+（期望接近基线 ~2.0 量级）；若仍居高不下，说明 bias 修正未生效，应立即停止排查。
+
+### 12.7 待验证
+
+1. 训练结束后打印各组门控的实际均值（`sigmoid` 后）：若激光门长期停在 ~0.05，
+   说明级联/激光分支未被有效利用；若升到 0.5 以上，说明激光信息确实有用。
+2. `sigmoid(occ_fuse_logit)` 的最终 α：→1 表示激光路 OCC 无效，→0 表示激光路主导。
+3. 消融：仅修 bda（关闭级联、激光增强、双向融合）再训一次，单独归因。
+4. 与纯视觉基线**同口径**评估（检测 mAP/NDS、OCC mIoU）——基线必须用同一个
+   `epoch_30_ema_custom.pth`，否则起点不同、对比不成立。
 
 ---
 

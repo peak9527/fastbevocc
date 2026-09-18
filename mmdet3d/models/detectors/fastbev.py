@@ -129,11 +129,13 @@ class FastBEV(CenterPoint):
     def multi_level_fuse(self, img_multi, pts_multi):
         """多层级融合：对 backbone 各 stage 输出做门控融合。
 
-        仅对 neck 实际消费的层级（self.fusion_level_ids）做融合，其余层级
-        原样透传，从而保证：
-        1) 返回的列表长度与 backbone 输出一致，neck 的 input_feature_index
-           索引语义不受影响；
-        2) 每个 level_fusions 模块都被消费，参数都有梯度（DDP 安全）。
+        - 非级联（cascade_fusion=False）：仅对 neck 实际消费的层级
+          （self.fusion_level_ids）做融合，其余层级原样透传，保证每个
+          level_fusions 模块都被消费、参数都有梯度（DDP 安全）。
+        - 级联（cascade_fusion=True）：为**所有**层级做融合，且 level i 额外
+          消费上一层融合结果（self.level_downs 下采样 + 对齐通道后）作为第三路
+          输入。这样 neck 未直接消费的中间层（如 level1）也能经下一层回传拿到
+          梯度，同时激光特征由细到粗逐级流动。
 
         Args:
             img_multi (list[torch.Tensor]): 图像 BEV 多尺度特征
@@ -144,17 +146,27 @@ class FastBEV(CenterPoint):
         """
         # 层级 id -> 门控融合模块下标
         level2idx = {lid: i for i, lid in enumerate(self.fusion_level_ids)}
+        cascade = getattr(self, 'cascade_fusion', False)
         fused_multi = []
+        prev_fused = None
         for lid, (img_f, pts_f) in enumerate(zip(img_multi, pts_multi)):
             if lid not in level2idx:
-                # neck 不消费该层级，直接透传避免引入无梯度参数
+                # 非级联模式下 neck 不消费该层级，直接透传避免引入无梯度参数
                 fused_multi.append(img_f)
                 continue
-            gate = self.level_fusions[level2idx[lid]](
-                torch.cat([img_f, pts_f], dim=1))
+            idx = level2idx[lid]
+            cat_feats = [img_f, pts_f]
+            if cascade and prev_fused is not None:
+                # 上一层融合结果下采样到当前分辨率并对齐通道，作为第三路输入
+                cat_feats.append(self.level_downs[idx - 1](prev_fused))
+            gate = self.level_fusions[idx](torch.cat(cat_feats, dim=1))
             img_gate = gate[:, 0:1, :, :]
             pts_gate = gate[:, 1:2, :, :]
-            fused_multi.append(img_gate * img_f + pts_gate * pts_f)
+            fused = img_gate * img_f + pts_gate * pts_f
+            if len(cat_feats) > 2:
+                fused = fused + gate[:, 2:3, :, :] * cat_feats[2]
+            fused_multi.append(fused)
+            prev_fused = fused
         return fused_multi
 
     def forward_train(self,
@@ -660,6 +672,19 @@ class FastBEVOCC(FastBEV):
             backbone 的每个 stage 输出后都做一次跨模态融合，再送入 neck。
             要求 img/pts 的 bev_encoder_backbone 都输出相同数量的多尺度特征
             （backbone_output_ids 长度一致），且对应 stage 通道数相同。
+        cascade_fusion (bool): 是否启用级联门控融合。若为 True：
+            1) 为 backbone 的**所有** stage 建门控融合（不再局限于 neck 消费层）；
+            2) level i 的融合额外消费 level i-1 的融合结果（stride-2 卷积下采样
+               并对齐通道后），使 neck 未直接消费的中间层（如 level1）也能通过
+               level2 回传拿到梯度，DDP 安全，且激光信息由细到粗逐级流动。
+            关闭时保持原行为：只为 neck 消费层建融合，其余层级原样透传。
+        gate_bias_first (float): 门控输出层（nn.Conv2d(hid, N, 1)）bias 初值。
+            第一路（图像/主分支）bias 设为 +b，其余路设为 -b；0 表示不启用
+            （bias 全 0 → sigmoid=0.5，训练第 0 步就把随机初始化的新分支特征
+            以 50% 权重掺进已收敛的预训练 BEV 特征，造成分布冲击）。
+            推荐 2.0~3.0：初始输出 ≈ 原基线行为，训练中由网络自主学习抬高
+            其他分支。作用于 level_fusions / gate_net / rev_gate_net
+            （rev_gate_net 的第一路是激光分支，因此初始为激光主导）。
     """
 
     def __init__(self,
@@ -675,10 +700,14 @@ class FastBEVOCC(FastBEV):
                  fusion=None,
                  reverse_fusion=None,
                  multi_level_fusion=False,
+                 cascade_fusion=False,
+                 gate_bias_first=0.0,
                  init_cfg=None,
                  **kwargs):
         super(FastBEVOCC, self).__init__(init_cfg=init_cfg, **kwargs)
         self.multi_level_fusion = multi_level_fusion
+        self.cascade_fusion = cascade_fusion
+        self.gate_bias_first = gate_bias_first
         self.occ_head = None
         if occ_head is not None:
             self.occ_head = builder.build_head(occ_head)
@@ -766,6 +795,8 @@ class FastBEVOCC(FastBEV):
                     nn.Conv2d(hid_c, 2, 1),
                     nn.Sigmoid(),
                 )
+                # 让模型从"图像主导"出发，保护预训练 BEV 特征（详见方法注释）
+                self._init_gate_bias(self.gate_net)
                 self.fusion = nn.Identity()  # 占位，实际融合在 fuse_bev_feats 中
             else:
                 raise ValueError(f"Unsupported fusion type: {fusion_type}")
@@ -808,6 +839,8 @@ class FastBEVOCC(FastBEV):
                     nn.Conv2d(rev_hid_c, 2, 1),
                     nn.Sigmoid(),
                 )
+                # 第一路是激光分支，因此初始为"激光主导"，图像语义由网络逐步引入
+                self._init_gate_bias(self.rev_gate_net)
                 self.rev_enabled = True
 
             # ---- 多层级融合：为 neck 实际消费的每个 stage 建门控融合单元 ----
@@ -825,32 +858,83 @@ class FastBEVOCC(FastBEV):
                     "多层级融合需要 backbone 配置 num_channels"
                 assert len(img_ch) == len(pts_ch), \
                     f"图像/激光 backbone stage 数不一致: {len(img_ch)} vs {len(pts_ch)}"
+                assert list(img_ch) == list(pts_ch), \
+                    "门控融合按元素加权求和（g*img + g*pts），要求对应 stage " \
+                    f"通道数一致: {img_ch} vs {pts_ch}"
                 self.num_fusion_levels = len(img_ch)
-                # 读取 neck 实际消费的层级。注意必须从"已构建的 neck 实例"
-                # 读取：FPN_LSS 的 input_feature_index 有类默认值 (0, 2)，
-                # 配置里常常不显式写，读配置 dict 会拿到兜底值而误判。
-                neck = getattr(self, 'img_bev_encoder_neck', None)
-                if neck is not None and hasattr(neck, 'input_feature_index'):
-                    consumed = neck.input_feature_index
+                if self.cascade_fusion:
+                    # 级联模式：所有层级都建门控融合。neck 未直接消费的中间层
+                    # 通过"下一层消费上一层融合结果"回传梯度，DDP 安全，
+                    # 且激光特征由细到粗逐级流动。
+                    self.fusion_level_ids = list(range(self.num_fusion_levels))
                 else:
-                    consumed = list(range(self.num_fusion_levels))
-                self.fusion_level_ids = sorted(set(int(i) for i in consumed))
-                for lid in self.fusion_level_ids:
-                    assert 0 <= lid < self.num_fusion_levels, \
-                        f"neck 消费的层级 {lid} 超出 backbone 输出层数"
+                    # 读取 neck 实际消费的层级。注意必须从"已构建的 neck 实例"
+                    # 读取：FPN_LSS 的 input_feature_index 有类默认值 (0, 2)，
+                    # 配置里常常不显式写，读配置 dict 会拿到兜底值而误判。
+                    neck = getattr(self, 'img_bev_encoder_neck', None)
+                    if neck is not None and hasattr(neck, 'input_feature_index'):
+                        consumed = neck.input_feature_index
+                    else:
+                        consumed = list(range(self.num_fusion_levels))
+                    self.fusion_level_ids = sorted(set(int(i) for i in consumed))
+                    for lid in self.fusion_level_ids:
+                        assert 0 <= lid < self.num_fusion_levels, \
+                            f"neck 消费的层级 {lid} 超出 backbone 输出层数"
                 self.level_fusions = nn.ModuleList()
+                self.level_downs = nn.ModuleList()
                 hid_c = fusion.get('hidden_channels', 64)
-                for lid in self.fusion_level_ids:
-                    # 每个被消费的 level 一个门控融合
+                for idx, lid in enumerate(self.fusion_level_ids):
+                    in_c = img_ch[lid] + pts_ch[lid]
+                    n_gate = 2
+                    if self.cascade_fusion and idx > 0:
+                        # 第三路输入：上一层融合结果（stride-2 下采样 + 对齐通道）
+                        in_c += img_ch[lid]
+                        n_gate = 3
+                        self.level_downs.append(
+                            nn.Conv2d(
+                                img_ch[self.fusion_level_ids[idx - 1]],
+                                img_ch[lid],
+                                kernel_size=3,
+                                stride=2,
+                                padding=1))
                     level_gate = nn.Sequential(
-                        ConvModule(img_ch[lid] + pts_ch[lid], hid_c, 3,
+                        ConvModule(in_c, hid_c, 3,
                                    padding=1,
                                    norm_cfg=dict(type='BN'),
                                    act_cfg=dict(type='ReLU')),
-                        nn.Conv2d(hid_c, 2, 1),
+                        nn.Conv2d(hid_c, n_gate, 1),
                         nn.Sigmoid(),
                     )
+                    self._init_gate_bias(level_gate)
                     self.level_fusions.append(level_gate)
+
+    def _init_gate_bias(self, gate_seq):
+        """门控输出层 bias 初始化：第一路主导，其余路近似关闭。
+
+        门控最后一层是 ``nn.Conv2d(hid, N, 1)``，bias 默认为全 0 →
+        ``sigmoid(0) = 0.5``，训练第 0 步各个分支就各占一半权重，等于把随机
+        初始化的新分支特征直接掺进已收敛的预训练 BEV 特征里，造成分布冲击
+        （实测表现为检测 heatmap loss 在 warmup 阶段居高不下）。
+
+        这里把第一路（图像/主分支）bias 设为 ``+gate_bias_first``、其余路设为
+        ``-gate_bias_first``，使初始输出≈原基线行为，训练中再由网络自主学习
+        抬高其他分支。``gate_bias_first=0`` 时不做任何处理（保持原行为）。
+
+        Args:
+            gate_seq (nn.Sequential): 门控网络，最后一个 nn.Conv2d 为输出层。
+        """
+        if not self.gate_bias_first:
+            return
+        conv = None
+        for m in gate_seq:
+            if isinstance(m, nn.Conv2d):
+                conv = m
+        if conv is None or conv.bias is None:
+            return
+        b = float(self.gate_bias_first)
+        with torch.no_grad():
+            conv.bias.fill_(-b)
+            conv.bias[0] = b
 
     @torch.no_grad()
     @force_fp32()

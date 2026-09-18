@@ -86,6 +86,20 @@ model = dict(
     ),
     # ---- 优化 2：多层级融合（每个 stage 后都做门控融合） ----
     multi_level_fusion=True,
+    # 级联门控融合：所有 stage 都建门控融合，level i 额外消费 level i-1 的融合
+    # 结果（stride-2 下采样 + 对齐通道）作为第三路输入。
+    # 解决的问题：FPN_LSS.forward 硬编码只取 input_feature_index 的两层（默认
+    # (0, 2)），level1 不被 neck 消费 → 非级联模式下若给它建融合模块，参数拿
+    # 不到梯度，DDP 会报 reduction 未完成，只能原样透传（激光中层信息浪费）。
+    # 级联后 level1 经 level2 回传拿到梯度，激光特征由细到粗逐级流动，
+    # 且 neck / backbone 结构与权重完全不变。
+    cascade_fusion=True,
+    # 门控输出层 bias 初始化：第一路（图像）+3、其余路 -3 → sigmoid ≈ 0.95/0.05。
+    # bias 默认为 0 → sigmoid(0)=0.5，训练第 0 步就会把随机初始化的激光/级联
+    # 分支特征以 50% 权重掺进已收敛的 epoch_30_ema_custom.pth 的 BEV 特征，
+    # 对检测 heatmap 与 occ 造成分布冲击。改为图像主导后初始行为≈原基线，
+    # 由网络在训练中自主学习抬高其他分支。
+    gate_bias_first=3.0,
     # ---- 门控融合（最后一层也做，与多层级融合互补） ----
     fusion=dict(
         type='gated',
@@ -265,6 +279,8 @@ optimizer = dict(
             'pts_proj': dict(lr_mult=5.0),
             'gate_net': dict(lr_mult=5.0),
             'level_fusions': dict(lr_mult=5.0),
+            # 级联融合的下采样投影层（level0->1、level1->2），同样随机初始化
+            'level_downs': dict(lr_mult=5.0),
             # 方案 A 反向融合（随机初始化，同样给 5x）
             'rev_pts_proj': dict(lr_mult=5.0),
             'rev_img_proj': dict(lr_mult=5.0),
@@ -292,5 +308,6 @@ evaluation = dict(interval=1, start=20, pipeline=test_pipeline)
 checkpoint_config = dict(interval=1, max_keep_ckpts=5)
 
 # 用基线模型权重初始化（激光分支随机初始化）
-load_from = 'work_dirs/fastbev-occ-r50-cbgs-custom/epoch_24_ema.pth'
 resume_from = None
+load_from = 'data/ckpts/epoch_30_ema_custom.pth'
+
