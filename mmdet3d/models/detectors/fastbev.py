@@ -1155,6 +1155,35 @@ class FastBEVOCC(FastBEV):
             losses.update(losses_occ)
         return losses
 
+    @staticmethod
+    def _has_points(points):
+        """判断本帧是否有可用点云（用于激光缺失时的纯视觉推理兜底）。
+
+        Args:
+            points (list[torch.Tensor] | torch.Tensor | None): 每帧点云，
+                单个张量形状为 (N_i, C)。None 表示激光缺失（驱动掉线、
+                未发布点云），空张量 / numel==0 表示收到无效帧。
+
+        Returns:
+            bool: True → 走正常双模态融合前向；
+                False → 走纯视觉兜底前向（跳过激光分支与 pts_occ_head）。
+
+        Note:
+            这里只做**廉价的形状判据**。NaN / 时间戳停滞 / 点数异常偏少等更
+            细的有效性判定建议放在上层的健康监测模块处理：在 forward 里做
+            ``torch.isnan(x).any()`` 会触发 GPU 同步，影响实时性。
+
+            批量推理时是整批统一判定（只要有任意一帧有点云就走融合路径），
+            因此建议部署时按 batch_size=1 使用，逐帧独立决策。
+        """
+        if points is None:
+            return False
+        if isinstance(points, (list, tuple)):
+            if len(points) == 0:
+                return False
+            return any(p is not None and p.numel() > 0 for p in points)
+        return points.numel() > 0
+
     def simple_test(self,
                     points,
                     img_metas,
@@ -1163,11 +1192,23 @@ class FastBEVOCC(FastBEV):
                     **kwargs):
         """Test function without augmentation.
 
+        支持激光缺失时的**纯视觉兜底**：当 ``points`` 为 None 或空（激光缺失）
+        而模型启用了融合分支时，跳过 ``extract_pts_feat`` 与 ``pts_occ_head``，
+        直接用相机 BEV 特征喂检测头与 OCC 头，保证单模态仍可推理而不崩溃。
+
+        Args:
+            points (list[torch.Tensor] | torch.Tensor | None): 点云。None /
+                空表示激光缺失，此时走纯视觉兜底前向。
+            img_metas (list[dict]): 每帧元信息（推理时只需 'box_type_3d'）。
+            img (tuple): 图像输入 7 元组。
+
         Returns:
             list[dict]: Each dict contains 'pts_bbox' (3D object detection
                 results) and 'occ' (occupancy prediction, shape (Dx, Dy, Dz)).
         """
-        if self.multi_level_fusion and self.with_lidar:
+        # 激光可用性：None / 空点云时走纯视觉兜底（extract_pts_feat 不能接受 None）
+        has_pts = self._has_points(points)
+        if self.multi_level_fusion and self.with_lidar and has_pts:
             img_feats, _, _, img_multi = self.extract_feat(
                 points, img=img, img_metas=img_metas,
                 return_multi_level=True, **kwargs)
@@ -1182,11 +1223,14 @@ class FastBEVOCC(FastBEV):
         else:
             img_feats, _, _ = self.extract_feat(
                 points, img=img, img_metas=img_metas, **kwargs)
-            if self.with_lidar:
+            if self.with_lidar and has_pts:
                 pts_bev = self.extract_pts_feat(points)
                 fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
                 bev_feats = [fused_bev]
             else:
+                # 激光缺失（或未启用融合）：纯视觉前向，直接用相机 BEV。
+                # 相机分支是完整自包含的，输出与融合 BEV 同形状（256@200x200），
+                # 因此 head 可直接消费，无需构造零张量。
                 bev_feats = img_feats
 
         bbox_list = [dict() for _ in range(len(img_metas))]
@@ -1196,8 +1240,10 @@ class FastBEVOCC(FastBEV):
             result_dict['pts_bbox'] = pts_bbox
         if self.occ_head is not None:
             occ_pred = self.occ_head(bev_feats[0])
-            # 激光 OCC head 融合
-            if self.pts_occ_head is not None and self.with_lidar:
+            # 激光 OCC head 融合。激光缺失时必须跳过：pts_occ_head 在全零
+            # 特征上的输出是无意义的随机预测，叠加后会污染主 OCC；此时直接
+            # 使用主 occ_head 在相机 BEV 上的预测即可。
+            if self.pts_occ_head is not None and self.with_lidar and has_pts:
                 if self.multi_level_fusion:
                     # 多层级融合时，pts_bev 需要重新计算
                     _, pts_bev_for_occ = self.extract_pts_feat(
@@ -1220,7 +1266,9 @@ class FastBEVOCC(FastBEV):
                       img_metas=None,
                       img_inputs=None,
                       **kwargs):
-        if self.multi_level_fusion and self.with_lidar:
+        # 与 simple_test 保持一致：激光缺失时跳过融合分支
+        has_pts = self._has_points(points)
+        if self.multi_level_fusion and self.with_lidar and has_pts:
             img_feats, _, _, img_multi = self.extract_feat(
                 points, img=img_inputs, img_metas=img_metas,
                 return_multi_level=True, **kwargs)
@@ -1235,11 +1283,12 @@ class FastBEVOCC(FastBEV):
         else:
             img_feats, _, _ = self.extract_feat(
                 points, img=img_inputs, img_metas=img_metas, **kwargs)
-            if self.with_lidar:
+            if self.with_lidar and has_pts:
                 pts_bev = self.extract_pts_feat(points)
                 fused_bev = self.fuse_bev_feats(img_feats[0], pts_bev)
                 bev_feats = [fused_bev]
             else:
+                # 激光缺失：纯视觉前向
                 bev_feats = img_feats
         assert self.with_pts_bbox
         outs = self.pts_bbox_head(self._det_feats(bev_feats))

@@ -376,6 +376,9 @@ custom_hooks = [
         type='MEGVIIEMAHook',
         init_updates=5280,
         priority='NORMAL',
+        # EMA checkpoint 由该 hook 自行落盘，不受 checkpoint_config 的
+        # max_keep_ckpts 约束，需在此单独限制保留个数。
+        max_keep_ckpts=5,
     ),
 ]
 

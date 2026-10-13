@@ -67,11 +67,16 @@ class MEGVIIEMAHook(Hook):
     Detection/BEVDepth/blob/main/callbacks/ema.py.
     """
 
-    def __init__(self, init_updates=0, decay=0.9990, resume=None):
+    def __init__(self, init_updates=0, decay=0.9990, resume=None,
+                 max_keep_ckpts=-1):
         super().__init__()
         self.init_updates = init_updates
         self.resume = resume
         self.decay = decay
+        # 最多保留的 EMA checkpoint 个数；-1 表示全部保留。
+        # 该 hook 自行落盘（不经过 mmcv CheckpointHook），配置里的
+        # checkpoint_config.max_keep_ckpts 管不到它，需单独设置。
+        self.max_keep_ckpts = max_keep_ckpts
 
     def before_run(self, runner):
         from torch.nn.modules.batchnorm import SyncBatchNorm
@@ -114,3 +119,14 @@ class MEGVIIEMAHook(Hook):
         save_path = os.path.join(runner.work_dir, save_path)
         torch.save(ema_checkpoint, save_path)
         runner.logger.info(f'Saving ema checkpoint at {save_path}')
+
+        # 清理多余的 EMA checkpoint（与 mmcv CheckpointHook 的清理规则一致）
+        if self.max_keep_ckpts > 0:
+            for _epoch in range(
+                    runner.epoch + 1 - self.max_keep_ckpts, 0, -1):
+                ckpt_path = os.path.join(runner.work_dir,
+                                         f'epoch_{_epoch}_ema.pth')
+                if os.path.isfile(ckpt_path):
+                    os.remove(ckpt_path)
+                    runner.logger.info(
+                        f'Remove redundant ema checkpoint {ckpt_path}')

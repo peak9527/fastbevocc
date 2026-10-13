@@ -53,10 +53,19 @@ def parse_args():
         '--auto-resume',
         action='store_true',
         help='resume from the latest checkpoint automatically')
+    # 默认开启训练中验证（配了 evaluation 却没传 --validate 导致评估不生效，
+    # 是常见疏忽）；不想验证时显式传 --no-validate 关闭。
     parser.add_argument(
         '--validate',
+        dest='validate',
         action='store_true',
-        help='whether not to evaluate the checkpoint during training')
+        default=True,
+        help='evaluate the checkpoint during training (default: on)')
+    parser.add_argument(
+        '--no-validate',
+        dest='validate',
+        action='store_false',
+        help='do NOT evaluate the checkpoint during training')
     group_gpus = parser.add_mutually_exclusive_group()
     group_gpus.add_argument(
         '--gpus',
