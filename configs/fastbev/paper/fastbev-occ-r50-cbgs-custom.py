@@ -322,10 +322,22 @@ share_data_config = dict(
     ],
 )
 
-# 目前只有 train pkl；val 先复用同一 pkl 评估 occ mIoU（后续可换 val pkl）
+# val/test 用独立的 yk_c1_infos_val.pkl 评估 occ mIoU——该 pkl 已含 occ GT
+# （occ_path 指向 occ_gts_val/.../labels.npz，已逐样本核验存在）。
+# 不再复用 train pkl，避免"在训练集上自评"造成的 occ mIoU 泄漏虚高。
+ann_file = 'yk_c1_infos_train.pkl'
+val_ann_file = 'yk_c1_infos_val.pkl'
+
+# ========== 数据 ==========
+# 深度监督范围 vs 激光覆盖（编辑提示，勿当 bug）：
+#   grid_config['depth']=[1.0,45.0,0.5] → D=88，决定图像特征可达半径 ≤45m；
+#   point_cloud_range=±40m → 激光/occ 栅格覆盖整个 ±40m 方形（角 56.6m 处图像不可达）。
+#   远角只由激光重建；纯视觉兜底时 45m 外为图像死区。属已知对称性差异，
+#   若要对齐图像可达半径，需把 depth 上界提到 >=57m（D 变，会破坏 img_view_transformer
+#   预训练权重加载，须独立重训），故当前保持不变。
 test_data_config = dict(
     pipeline=test_pipeline,
-    ann_file=ann_file)
+    ann_file=val_ann_file)
 
 data = dict(
     # 0.4m BEV（200x200）+ 6 相机 320x896，显存约为 0.8m 的 2.4 倍。

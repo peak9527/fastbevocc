@@ -702,12 +702,16 @@ class FastBEVOCC(FastBEV):
                  multi_level_fusion=False,
                  cascade_fusion=False,
                  gate_bias_first=0.0,
+                 occ_alpha_half_res=False,
                  init_cfg=None,
                  **kwargs):
         super(FastBEVOCC, self).__init__(init_cfg=init_cfg, **kwargs)
         self.multi_level_fusion = multi_level_fusion
         self.cascade_fusion = cascade_fusion
         self.gate_bias_first = gate_bias_first
+        # 方案B门控瘦身开关（默认关）：True 时门控在 100×100 算、bilinear 放大回 200
+        self.gate_half_res = False
+        self.rev_half_res = False
         self.occ_head = None
         if occ_head is not None:
             self.occ_head = builder.build_head(occ_head)
@@ -723,6 +727,22 @@ class FastBEVOCC(FastBEV):
             init_logit = math.log(occ_fusion_weight / (1 - occ_fusion_weight))
             self.occ_fuse_logit = nn.Parameter(
                 torch.tensor(init_logit, dtype=torch.float32))
+            # 2D 空间 occ 融合门控：预测按 BEV 位置 (x,y) 的门控 logit，sigmoid 后在
+            # (Dz, C) 维广播（occ_pred 布局为 B,Dx,Dy,Dz,C）。输入 = 纯相机 BEV || 激光
+            # BEV（两路分支信号，非被加权的 logits → 无"抬置信度骗门控"的 rank-1 崩坏面）。
+            # 随机初始化输出≈0 → 初始 alpha≈sigmoid(occ_fuse_logit)=occ_fusion_weight，
+            # 起点行为≈原标量模型，训练中由主 OCC loss 逐步空间化（近场信激光、远场信图像）。
+            from mmcv.cnn import ConvModule
+            self.occ_alpha_head = nn.Sequential(
+                ConvModule(
+                    2 * self.pts_occ_head.in_dim, 128, 3, padding=1,
+                    norm_cfg=dict(type='BN'),
+                    act_cfg=dict(type='ReLU')),
+                nn.Conv2d(128, 1, 1))
+            # 方案B：True 时此门控在 100×100 算、放大回 200（见 _gate2d）
+            self.occ_alpha_half_res = occ_alpha_half_res
+            # 诊断暂存：供 GateMonitorHook 读取
+            self._occ_gate_stat = None
         self.det_downsample = None
         self.detach_det = False
         if det_downsample is not None:
@@ -789,6 +809,8 @@ class FastBEVOCC(FastBEV):
                 self.img_proj = nn.Conv2d(in_c_img, out_c, 1, bias=False)
                 self.pts_proj = nn.Conv2d(in_c_pts, out_c, 1, bias=False)
                 # 门控网络：concat 两分支特征 → 预测 2 通道门控权重
+                # 方案B：half_res=True 时该门控在 100×100 算、放大回 200
+                self.gate_half_res = fusion.get('half_res', False)
                 self.gate_net = nn.Sequential(
                     ConvModule(out_c * 2, hid_c, 3, padding=1,
                                norm_cfg=dict(type='BN'), act_cfg=dict(type='ReLU')),
@@ -828,6 +850,8 @@ class FastBEVOCC(FastBEV):
                     rev_out_c,
                     1,
                     bias=False)
+                # 方案B：rev 门控 half_res 开关
+                self.rev_half_res = reverse_fusion.get('half_res', False)
                 self.rev_gate_net = nn.Sequential(
                     ConvModule(
                         rev_out_c * 2,
@@ -994,6 +1018,29 @@ class FastBEVOCC(FastBEV):
             return multi_feats, x
         return x
 
+    @staticmethod
+    def _gate2d(net, inp, half_res):
+        """方案B门控：在降采样分辨率算门控、再放大回原分辨率（算力优化）。
+
+        门控是逐格软置信度先验：half_res=True 时先把输入 BEV 降到 100×100，
+        nets（仍是 3×3）在低分辨率上算、再 bilinear 放大回 200×200。这样：
+          - 算力约为满分辨率 3×3 的 1/4 + down/up 开销（occ/gate/rev 合计
+            ~59 → ~15 GMAC）；
+          - 保留 3×3 局部语义，同时上采样天然把门控图插值平滑，规避
+            "满分辨率 1×1 逐格独立可能椒盐"的方案A风险。
+        half_res=False（默认）时原样直通，整个模块行为不变。
+        """
+        B, C, H, W = inp.shape
+        if not half_res:
+            return net(inp)
+        low = F.interpolate(
+            inp, scale_factor=0.5, mode='bilinear', align_corners=False)
+        g = net(low)
+        if g.shape[-2:] != (H, W):
+            g = F.interpolate(
+                g, size=(H, W), mode='bilinear', align_corners=False)
+        return g
+
     def fuse_bev_feats(self, img_bev, pts_bev):
         """BEV 特征融合。
 
@@ -1013,8 +1060,11 @@ class FastBEVOCC(FastBEV):
             # 投影到相同通道数
             img_feat = self.img_proj(img_bev)
             pts_feat = self.pts_proj(pts_bev)
-            # 预测门控权重 [B, 2, H, W]
-            gate = self.gate_net(torch.cat([img_feat, pts_feat], dim=1))
+            # 预测门控权重 [B, 2, H, W]（可选方案B：half_res 时在 100×100 算+放大）
+            gate = self._gate2d(
+                self.gate_net,
+                torch.cat([img_feat, pts_feat], dim=1),
+                self.gate_half_res)
             img_gate = gate[:, 0:1, :, :]
             pts_gate = gate[:, 1:2, :, :]
             # 加权求和
@@ -1042,7 +1092,10 @@ class FastBEVOCC(FastBEV):
             return pts_bev
         pts_feat = self.rev_pts_proj(pts_bev)
         img_feat = self.rev_img_proj(fused_bev)
-        gate = self.rev_gate_net(torch.cat([pts_feat, img_feat], dim=1))
+        gate = self._gate2d(
+            self.rev_gate_net,
+            torch.cat([pts_feat, img_feat], dim=1),
+            self.rev_half_res)
         pts_gate = gate[:, 0:1, :, :]
         img_gate = gate[:, 1:2, :, :]
         return pts_gate * pts_feat + img_gate * img_feat
@@ -1134,20 +1187,49 @@ class FastBEVOCC(FastBEV):
                     pts_bev_for_occ = pts_bev_final
                 else:
                     pts_bev_for_occ = pts_bev
+                # 门控输入必须取 rev_fuse 之前的纯激光 BEV（multi/single 分支的
+                # pts_bev_final / pts_bev 均未注入图像语义）。若放在下面 rev_fuse 之后，
+                # pts_bev_for_occ 已被覆盖成含图像语义的融合特征，门控就测不出
+                # "此处激光本身可不可信"，违背下面注释声明的设计。
+                raw_pts_for_gate = pts_bev_for_occ
                 # 方案 A 反向融合：用融合特征（含图像语义）调制激光分支
                 pts_bev_for_occ = self.rev_fuse_bev_feats(
                     pts_bev_for_occ, bev_feats[0])
                 pts_occ_pred = self.pts_occ_head(pts_bev_for_occ)
-                # alpha = sigmoid(occ_fuse_logit)，可学习标量：
-                # 主 OCC loss 直接作用在融合结果上，梯度回传到 occ_fuse_logit，
-                # 训练自动决定图像 OCC / 激光 OCC 的加权比例
-                alpha = torch.sigmoid(self.occ_fuse_logit)
+                # alpha = sigmoid(2D 空间门控 logit + 全局先验偏置 occ_fuse_logit)：
+                #   - occ_alpha_head 用"纯相机 BEV || 纯激光 BEV"预测 [B,1,200,200] 门控 logit，
+                #     sigmoid 后在 (Dz, C) 维广播 → 同一 BEV 格下 33 类统一加权，
+                #     网络自动学到"近场信激光、远场信图像"的按位置配比；
+                #   - occ_fuse_logit 保留为全局先验偏置（起点 alpha≈occ_fusion_weight），
+                #     门控模块随机初始化≈0 → 起点行为≈原标量模型，训练中逐步空间化。
+                #   主 OCC loss 直接作用在融合结果上，梯度回传给 occ_alpha_head 与
+                #   occ_fuse_logit，自动学习最优空间配比。
+                gate = self._gate2d(
+                    self.occ_alpha_head,
+                    torch.cat([img_feats[0], raw_pts_for_gate], dim=1),
+                    self.occ_alpha_half_res)
+                B, Dx, Dy, _, _ = occ_pred.shape
+                alpha = torch.sigmoid(
+                    gate.permute(0, 2, 3, 1).reshape(B, Dx, Dy, 1, 1)
+                    + self.occ_fuse_logit)
                 occ_pred = alpha * occ_pred + (1 - alpha) * pts_occ_pred
+                # 诊断暂存：供 GateMonitorHook 读取
+                self._occ_gate_stat = {
+                    'alpha_mean': alpha.detach().mean().item(),
+                    'alpha_std': alpha.detach().std().item(),
+                    'spatial_gate_logit_mean': gate.detach().mean().item(),
+                    'spatial_gate_logit_std': gate.detach().std().item(),
+                    'occ_fuse_logit': self.occ_fuse_logit.detach().item(),
+                }
                 # 激光分支辅助监督（权重 0.5），保证 pts_occ_head 自身可训练
                 pts_losses_occ = self.pts_occ_head.loss(
                     pts_occ_pred, voxel_semantics, mask_camera)
                 for k, v in pts_losses_occ.items():
                     losses[f'pts_{k}'] = 0.5 * v
+                # 把激光分支加权 loss 并入诊断 stat，供 GateMonitorHook 打印，作为
+                # "激光分支在训练"的每 iter 直接证据（与日志中 pts_loss_occ 数值一致）。
+                self._occ_gate_stat['pts_loss_occ'] = (
+                    0.5 * pts_losses_occ['loss_occ']).detach().item()
 
             # 融合后的 OCC 预测参与主监督（CE + aux）
             losses_occ = self.occ_head.loss(occ_pred, voxel_semantics,
@@ -1245,16 +1327,26 @@ class FastBEVOCC(FastBEV):
             # 使用主 occ_head 在相机 BEV 上的预测即可。
             if self.pts_occ_head is not None and self.with_lidar and has_pts:
                 if self.multi_level_fusion:
-                    # 多层级融合时，pts_bev 需要重新计算
-                    _, pts_bev_for_occ = self.extract_pts_feat(
-                        points, return_multi_level=True)
+                    # 复用顶部多层级分支已算出的 pts_bev_final，避免重算整条激光流水线
+                    # （voxelize + pillar + scatter + 3-stage backbone + neck）
+                    pts_bev_for_occ = pts_bev_final
                 else:
                     pts_bev_for_occ = pts_bev
+                # 门控输入取 rev_fuse 之前的纯激光 BEV（与训练块一致）
+                raw_pts_for_gate = pts_bev_for_occ
                 # 方案 A 反向融合：用融合特征（含图像语义）调制激光分支
                 pts_bev_for_occ = self.rev_fuse_bev_feats(
                     pts_bev_for_occ, bev_feats[0])
                 pts_occ_pred = self.pts_occ_head(pts_bev_for_occ)
-                alpha = torch.sigmoid(self.occ_fuse_logit)
+                # 与训练一致：2D 空间门控 + 全局先验偏置（布局 B,Dx,Dy,Dz,C）
+                gate = self._gate2d(
+                    self.occ_alpha_head,
+                    torch.cat([img_feats[0], raw_pts_for_gate], dim=1),
+                    self.occ_alpha_half_res)
+                B, Dx, Dy, _, _ = occ_pred.shape
+                alpha = torch.sigmoid(
+                    gate.permute(0, 2, 3, 1).reshape(B, Dx, Dy, 1, 1)
+                    + self.occ_fuse_logit)
                 occ_pred = alpha * occ_pred + (1 - alpha) * pts_occ_pred
             occ_res = self.occ_head.get_occ(occ_pred)
             for result_dict, occ in zip(bbox_list, occ_res):

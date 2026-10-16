@@ -102,11 +102,16 @@ model = dict(
     # 由网络在训练中自主学习抬高其他分支。
     gate_bias_first=3.0,
     # ---- 门控融合（最后一层也做，与多层级融合互补） ----
+    # 算力优化方案 B（门控@100×100+放大回200）在代码里已支持、默认关闭；
+    # Run1 先保持满分辨率 3×3 验证"空间门控 vs 基线"单变量，Run2 再开启：
+    #   fusion=dict(..., half_res=True) 及 reverse_fusion=dict(..., half_res=True)、
+    #   模型顶层 occ_alpha_half_res=True，三处同开，单独归因瘦身收益。
     fusion=dict(
         type='gated',
         in_channels_img=256,
         in_channels_pts=256,
         out_channels=256,
+        half_res=True,
         hidden_channels=128),
     # ---- 方案 A：反向融合（双向融合）----
     # 正向：激光几何 → 图像语义分支；反向：融合特征（含图像语义）→ 调制激光
@@ -118,6 +123,7 @@ model = dict(
         in_channels_pts=256,       # 激光 BEV 特征 pts_bev_final
         in_channels_img=256,       # 融合 BEV 特征（含图像语义）
         out_channels=256,
+        half_res=True,
         hidden_channels=64),
     # ---- 优化 3：OCC 专用激光头 + 可学习融合权重 ----
     # 训练：主 OCC 与激光 OCC 按 alpha = sigmoid(occ_fuse_logit) 先融合，
@@ -145,6 +151,7 @@ model = dict(
         aux_loss_occ=None),                  # 激光 OCC 只用 CE，省显存
     # 可学习融合权重 alpha 的初始值（主 OCC 0.7 / 激光 OCC 0.3）
     occ_fusion_weight=0.7,
+    occ_alpha_half_res=True,
 )
 
 # ========== 数据 pipeline ==========
@@ -287,6 +294,8 @@ optimizer = dict(
             'rev_img_proj': dict(lr_mult=5.0),
             'rev_gate_net': dict(lr_mult=5.0),
             'occ_fuse_logit': dict(lr_mult=5.0),
+            # 2D 空间 occ 融合门控（随机初始化，同样给 5x）
+            'occ_alpha_head': dict(lr_mult=5.0),
         }))
 # max_norm=5 → 10：实测训练后期正常 grad_norm 稳定在 4.6~6.0，阈值 5 会让
 # 约一半 step 触发裁剪（等于随机压缩有效学习率）；放到 10 使裁剪只在真正
@@ -303,8 +312,8 @@ lr_config = dict(
     #   epoch 90-100: 1e-6（最后 10 epoch 充分收敛）
     # 衰减点不要前移：本配置新分支随机初始化且带 5x 学习率，
     # 过早衰减（如 [24,27]）会在欠拟合时就把 lr 压到 1e-6，收敛直接停滞。
-    step=[80, 90])
-runner = dict(type='EpochBasedRunner', max_epochs=100)
+    step=[18, 22])
+runner = dict(type='EpochBasedRunner', max_epochs=25)
 
 custom_hooks = [
     dict(
@@ -316,19 +325,29 @@ custom_hooks = [
         # 会留 100 个 ~294MB 的 EMA 文件，约 29GB）。
         max_keep_ckpts=5,
     ),
+    # 门控/融合诊断：每 50 iter 打印 occ 融合门控统计（alpha 均值/方差、
+    # 空间门控 logit 的均值/方差、occ_fuse_logit 先验）。alpha 恒低 → 激光
+    # 可能没被用起来；spatial_gate_logit std > 0 → 按位置自适应已生效。
+    dict(
+        type='GateMonitorHook',
+        after_iter=50,
+        priority='HIGH',
+    ),
 ]
 
-# 100 epoch 时验证开销必须收敛：验证集=5252 样本（与 train 同一 pkl），
-# 融合模型 2 卡推理一次约 20 分钟。若沿用 interval=1/start=20 会触发 81 次
-# 验证（约 27 小时），远超训练本身。改为从 epoch 80 起每 5 个 epoch 验一次
-# （80/85/90/95/100，共 5 次，约 1.7 小时），正好覆盖两次 lr 衰减前后的
-# 指标变化。需要更密集监控时改成 interval=1, start=90（约 2 小时）。
-# save_best 自动把验证指标最优的权重落盘（EvalHook 特性），
-# 避免 100 个 epoch 全留却不知用哪个。
-# 当前验证集 yk_c1_infos_val.pkl 未生成 occ GT，只有检测指标，
-# 故 save_best 用 'det/mAP_nuscenes'；为 val 生成 occ GT 后可改回 'occ/mIoU'。
+# 100 epoch 时验证开销必须收敛：验证集=4499 样本（独立 yk_c1_infos_val.pkl，
+# val/test 已从复用 train pkl 改为独立留出集，见基配置）。融合模型 2 卡推理
+# 一次约 20 分钟。若沿用 interval=1/start=20 会触发大量验证，远超训练本身。
+# 改为从 epoch 80 起每 5 个 epoch 验一次（80/85/90/95/100，共 5 次），正好覆盖
+# 两次 lr 衰减前后的指标变化。需要更密集监控时改成 interval=1, start=90。
+# save_best 自动把验证指标最优的权重落盘（EvalHook 特性），避免 100 个 epoch
+# 全留却不知用哪个。
+# 重要：yk_c1_infos_val.pkl 现含 occ GT（occ_gts_val/.../labels.npz，已核验），
+# 且自定义数据无 nuScenes 数据库目录（_nuscenes_db_available() 走 occ-only 分支），
+# 故 save_best='occ/mIoU' 有效且应保持（勿改回 det/mAP）。检测指标该 val 集
+# 因缺 nuScenes 数据库仍不评估。
 # 注意：训练中评估需要传 --validate（tools/train.py 已改为默认开启）。
-evaluation = dict(interval=5, start=80, pipeline=test_pipeline,
+evaluation = dict(interval=5, start=5, pipeline=test_pipeline,
                   save_best='occ/mIoU', rule='greater')
 #  save_best='det/mAP_nuscenes', rule='greater')  
 # 100 epoch 每轮同时落盘 epoch_N.pth(~866MB) + epoch_N_ema.pth(~294MB)，
@@ -337,5 +356,5 @@ checkpoint_config = dict(interval=1, max_keep_ckpts=5)
 
 # 用基线模型权重初始化（激光分支随机初始化）
 resume_from = None
-load_from = 'work_dirs/fastbev-occ-r50-cbgs-custom-fusion/epoch_24_ema.pth'
+load_from = 'data/ckpts/epoch_50_ema_mul.pth'
 
