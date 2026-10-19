@@ -312,8 +312,8 @@ lr_config = dict(
     #   epoch 90-100: 1e-6（最后 10 epoch 充分收敛）
     # 衰减点不要前移：本配置新分支随机初始化且带 5x 学习率，
     # 过早衰减（如 [24,27]）会在欠拟合时就把 lr 压到 1e-6，收敛直接停滞。
-    step=[18, 22])
-runner = dict(type='EpochBasedRunner', max_epochs=25)
+    step=[22,26,28])
+runner = dict(type='EpochBasedRunner', max_epochs=30)
 
 custom_hooks = [
     dict(
@@ -356,5 +356,5 @@ checkpoint_config = dict(interval=1, max_keep_ckpts=5)
 
 # 用基线模型权重初始化（激光分支随机初始化）
 resume_from = None
-load_from = 'data/ckpts/epoch_50_ema_mul.pth'
+load_from = 'data/ckpts/epoch_25_ema_mul.pth'
 

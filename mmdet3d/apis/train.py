@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
 import random
 import warnings
 
@@ -10,6 +11,7 @@ from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
                          build_runner, get_dist_info)
 from mmcv.utils import build_from_cfg
 from torch import distributed as dist
+from torch.optim import Optimizer
 
 from mmdet3d.datasets import build_dataset
 from mmdet3d.utils import find_latest_checkpoint
@@ -72,6 +74,88 @@ def set_random_seed(seed, deterministic=False):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+def _resume_or_load_checkpoint(runner, checkpoint_path, logger):
+    """Resume a run from ``checkpoint_path``.
+
+    ``runner.resume`` assumes the checkpoint stores the whole training state
+    (``meta`` with ``epoch``/``iter`` and, optionally, the optimizer state) and
+    raises ``KeyError: 'meta'`` for weight-only files, e.g. the
+    ``epoch_*_ema.pth`` files written by ``MEGVIIEMAHook`` or manually exported
+    weights. Such files are loaded as pretrained weights instead and, when they
+    expose an ``epoch`` field, the epoch counter is restored so the run keeps
+    going instead of silently restarting from scratch.
+
+    The file is read only once: ``runner.load_checkpoint`` loads the weights
+    into the model *and* returns the raw checkpoint dict, so no extra IO/memory
+    is spent on inspecting the file before deciding how to use it.
+    """
+    # 存在性预检：mmcv 抛出的 FileNotFoundError 埋在深层调用栈里，且不说明
+    # "文件为什么没了"——几乎总是 checkpoint_config 的 max_keep_ckpts 限制了
+    # 保留数量，较旧的权重已被自动清理。这里前置检查并直接给出仍可用的替代
+    # 路径，避免把"已被清理"误判成"路径写错"而反复重试。
+    # 远端路径（http / ceph 等）不做本地预检，仍交给 mmcv 处理。
+    if '://' not in checkpoint_path and not os.path.isfile(checkpoint_path):
+        directory = os.path.dirname(checkpoint_path) or '.'
+        try:
+            # 只列完整 checkpoint（含 meta / optimizer），EMA 权重另说
+            available = sorted(
+                n for n in os.listdir(directory)
+                if n.startswith('epoch_') and n.endswith('.pth')
+                and '_ema' not in n)
+        except OSError:
+            available = []
+        alternatives = [os.path.join(directory, n) for n in available]
+        latest = os.path.join(directory, 'latest.pth')
+        if os.path.isfile(latest):
+            alternatives.append(latest)
+        hint = ('可改用: ' + ', '.join(alternatives) if alternatives
+                else '该目录下没有任何 epoch_*.pth')
+        raise FileNotFoundError(
+            f'resume_from 指定的 checkpoint 不存在: {checkpoint_path}。'
+            '常见原因是 checkpoint_config 的 max_keep_ckpts 限制了保留'
+            f'数量，较旧的权重已被自动清理（{hint}）。'
+            '请改用仍存在的完整 checkpoint（含 meta / optimizer），'
+            '或调大 max_keep_ckpts 后重新训练。')
+
+    checkpoint = runner.load_checkpoint(checkpoint_path)
+    if not isinstance(checkpoint, dict):
+        logger.warning(f'{checkpoint_path} is not a valid checkpoint, skip '
+                       'resuming.')
+        return
+
+    meta = checkpoint.get('meta')
+    if meta is not None:
+        # Full training state: same bookkeeping as ``mmcv.BaseRunner.resume``.
+        runner._epoch = meta['epoch']
+        runner._iter = meta['iter']
+        if runner.meta is None:
+            runner.meta = dict()
+        runner.meta.setdefault('hook_msgs', dict())
+        # restore `last_ckpt`, `best_score`, `best_ckpt`, etc.
+        runner.meta['hook_msgs'].update(meta.get('hook_msgs', dict()))
+        runner.meta = meta
+        if 'optimizer' in checkpoint and isinstance(runner.optimizer,
+                                                    Optimizer):
+            runner.optimizer.load_state_dict(checkpoint['optimizer'])
+        logger.info(f'Resumed from {checkpoint_path} (epoch {runner.epoch}, '
+                    f'iter {runner.iter})')
+        return
+
+    # Weight-only checkpoint (EMA / exported weights): the weights are already
+    # loaded, only the training state is missing.
+    epoch = checkpoint.get('epoch')
+    if isinstance(epoch, int):
+        # `MEGVIIEMAHook` stores the 0-based index of the epoch that has just
+        # been finished, so training must continue with the next one.
+        runner._epoch = epoch + 1
+    logger.warning(
+        f'{checkpoint_path} stores no training state (`meta`), it is loaded '
+        'as pretrained weights only' +
+        (f' and training continues at epoch {runner.epoch + 1}'
+         if isinstance(epoch, int) else '') +
+        '. Optimizer state and iteration counter are not restored.')
 
 
 def train_segmentor(model,
@@ -171,7 +255,7 @@ def train_segmentor(model,
             runner.register_hook(hook, priority=priority)
 
     if cfg.resume_from:
-        runner.resume(cfg.resume_from)
+        _resume_or_load_checkpoint(runner, cfg.resume_from, logger)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
@@ -313,7 +397,7 @@ def train_detector(model,
         cfg.resume_from = resume_from
 
     if cfg.resume_from:
-        runner.resume(cfg.resume_from)
+        _resume_or_load_checkpoint(runner, cfg.resume_from, logger)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
